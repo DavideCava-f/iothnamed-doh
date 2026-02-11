@@ -11,8 +11,11 @@ include(GNUInstallDirs)
 include(CheckIncludeFile)
 include(CheckSymbolExists)
 
-set(LIBS_REQUIRED ioth iothdns iothconf iothaddr stropt)
-set(HEADERS_REQUIRED ioth.h iothaddr.h iothconf.h iothdns.h stropt.h strcase.h)
+# 1. Add 'wolfssl' to the required libraries list
+set(LIBS_REQUIRED ioth iothdns iothconf iothaddr stropt wolfssl)
+
+# 2. Add 'wolfssl/ssl.h' to the required headers list
+set(HEADERS_REQUIRED ioth.h iothaddr.h iothconf.h iothdns.h stropt.h strcase.h wolfssl/ssl.h)
 
 foreach(THISLIB IN LISTS LIBS_REQUIRED)
   find_library(LIB${THISLIB}_OK ${THISLIB})
@@ -34,8 +37,11 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 # configure_file(config.h.in config.h)
 
 add_executable(iothnamed main.c mainloop.c dnsreqq.c now.c utils.c arpainetx.c
-		tcpq.c auth.c process_dns_req.c cache.c fdtimeout.c)
-target_link_libraries(iothnamed ioth iothdns iothconf iothaddr stropt)
+        tcpq.c auth.c process_dns_req.c cache.c fdtimeout.c)
+
+# 3. Add 'wolfssl' to the target link libraries
+target_link_libraries(iothnamed ioth iothdns iothconf iothaddr stropt wolfssl)
+
 install(TARGETS iothnamed
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
@@ -43,4 +49,3 @@ add_subdirectory(man)
 
 add_custom_target(uninstall
   "${CMAKE_COMMAND}" -P "${PROJECT_SOURCE_DIR}/Uninstall.cmake")
-
