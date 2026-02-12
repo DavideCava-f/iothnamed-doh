@@ -98,9 +98,11 @@ int doh_wrap_dns_req(char* http_req, size_t http_req_max_len, char* buf, size_t 
             );
 
     if (header_len < 0 || (size_t)header_len >= http_req_max_len) {
+        printf("https-wrap: invalid header len\n");
         return -1; 
     }
     if ((size_t)header_len + len > http_req_max_len) {
+        printf("https-wrap: invalid https packet len\n");
         return -1; 
     }
     
@@ -111,7 +113,7 @@ int doh_wrap_dns_req(char* http_req, size_t http_req_max_len, char* buf, size_t 
 
 int doh_recv_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     int fd = (int)(intptr_t)ctx;
-    int ret = ioth_recv(fd, buf, sz, 0);
+    int ret = recv(fd, buf, sz, 0);
     if (ret < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return WOLFSSL_CBIO_ERR_WANT_READ;
@@ -122,7 +124,7 @@ int doh_recv_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 
 int doh_send_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     int fd = (int)(intptr_t)ctx;
-    int ret = ioth_send(fd, buf, sz, 0);
+    int ret = send(fd, buf, sz, 0);
     if (ret < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return WOLFSSL_CBIO_ERR_WANT_WRITE;
@@ -141,17 +143,19 @@ void init_ssl_ctx() {
         exit(0);
     }
     // bind calback functions
-    wolfSSL_SetIORecv(doh_ctx, doh_recv_cb);
-    wolfSSL_SetIOSend(doh_ctx, doh_send_cb);
+ //   wolfSSL_SetIORecv(doh_ctx, doh_recv_cb);
+   // wolfSSL_SetIOSend(doh_ctx, doh_send_cb);
+    printf("ssl context correctly initialized\n");
 }
 
 static int wake_doh(void) {
 	/* if the connection to the server is not active, do a asynch connect */
 	struct epoll_event ev = {
 		.events=POLLIN | POLLOUT,
-		.data.ptr = &tffd[fwdaddr_rr]
+		.data.ptr = &dohfd
 	};
 	if (dohfd < 0) {
+        printf("doh - connection not active, performing asynch connect\n");
 		int retval;
 		struct sockaddr_in6 sfwd = {.sin6_family = AF_INET6, .sin6_addr = fwdaddr[fwdaddr_rr], .sin6_port = htons(HTTPS_PORT)};
 		retval = dohfd = ioth_msocket(fstack, AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -165,8 +169,10 @@ static int wake_doh(void) {
         wolfSSL_connect(dohssl);
 
 		epoll_ctl(epollfd, EPOLL_CTL_ADD, dohfd, &ev);
-	} else
+	} else {
+        printf("doh - connection active\n");
 		epoll_ctl(epollfd, EPOLL_CTL_MOD, dohfd, &ev);
+    }
 	fwdaddr_rr = (fwdaddr_rr + 1) % fwdaddr_count;
 	return 0;
 }
@@ -231,6 +237,7 @@ void process_urfd(void) {
 				.sin6_addr = fwdaddr[fwdaddr_rr],
 				.sin6_port = htons(DNS_UDP_PORT)};
             
+            printf("Forwarding request to fstack\n");
             if(USE_DOH){
                 tcpq_enqueue(buf, len);
                 wake_doh();
@@ -306,6 +313,7 @@ static ssize_t dns_tcp_send(int fd, void *buf, size_t len, int flags) {
  * @return: Bytes written or -1 on error
  */
 ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, const char *hostname) {
+    printf("forwarding dns request to doh server\n");
     size_t overhead = 512;
     size_t req_max_len = len + overhead;
     
@@ -333,6 +341,7 @@ ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, const char *hostname) 
         return -1;
     }
 
+    printf("forwarding dns request to doh server successfull\n");
     return ret;
 }
 
@@ -393,14 +402,11 @@ static long parse_content_length(const char *headers) {
 ssize_t tcp_doh_recv(struct dohdata *dd) {
     ssize_t rlen;
 
-    /* PHASE 1: Read HTTP Headers */
     if (!dd->hdr_done) {
-        /* Read 1 byte at a time for simplicity in parsing headers, 
-           or read chunks and scan for \r\n\r\n. 
-           Here we read chunks into the remaining space of hdr_buf. */
-           
+         
         int max_read = sizeof(dd->hdr_buf) - dd->hdr_pos - 1; /* -1 for null terminator */
         if (max_read <= 0) {
+            printf("ERROR: Header too large\n");
             errno = EMSGSIZE; /* Headers too large */
             return -1;
         }
@@ -409,6 +415,8 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
         
         if (rlen <= 0) {
             /* Pass through WolfSSL errors/WANT_READ */
+            char error[2000];
+            printf("ERROR: WolfSSL error value: %s\n", wolfSSL_ERR_error_string(wolfSSL_get_error(dohssl, rlen), error));
             return rlen; 
         }
 
@@ -422,48 +430,42 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
             
             if (content_len < 0) {
                 /* Valid HTTP but missing Content-Length? */
+                printf("ERROR: valid https, missing Content-Length\n");
                 errno = EPROTO; 
                 return -1;
             }
 
-            /* Initialize the body buffer */
             dd->len = (size_t)content_len;
             dd->buf = malloc(dd->len);
             if (!dd->buf) {
+                printf("ERROR: cannot allocate message buf\n");
                 errno = ENOMEM;
                 return -1;
             }
             dd->pos = 0;
             dd->hdr_done = 1;
 
-            /* Handle Body Over-read:
-               If wolfSSL_read got part of the body along with headers, 
-               move it to the body buffer. */
+            // Handle Body Over-read
             int header_size = (body_start - dd->hdr_buf) + 4; /* +4 for \r\n\r\n */
             int body_bytes_read = dd->hdr_pos - header_size;
 
             if (body_bytes_read > 0) {
                 if ((size_t)body_bytes_read > dd->len) {
-                    /* Received more than Content-Length? Truncate or error. */
                      body_bytes_read = dd->len;
                 }
                 memcpy(dd->buf, body_start + 4, body_bytes_read);
                 dd->pos += body_bytes_read;
             }
             
-            /* If we finished reading the body immediately */
             if (dd->pos == dd->len) {
-                return rlen; /* Functionally similar to returning bytes read */
+                return rlen; 
             }
         } else {
-             /* Headers not complete yet, return 1 to indicate progress/keep alive 
-                or return rlen to match recv behavior */
              return rlen;
         }
     }
 
-    /* PHASE 2: Read DNS Body */
-    /* This runs if hdr_done is true (either set above or in previous call) */
+    // Read DNS Body 
     if (dd->hdr_done && dd->pos < dd->len) {
         rlen = wolfSSL_read(dd->ssl, (char *)dd->buf + dd->pos, dd->len - dd->pos);
         
@@ -474,7 +476,7 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
         dd->pos += rlen;
         return rlen;
     }
-
+    printf("buf: %s\n", dd->buf);
     return 0;
 }
 
@@ -582,6 +584,7 @@ void process_trfd(void *data) {
 void process_dohfd(uint32_t events) {
 	if (events & POLLOUT) {
 		/* POLLOUT event, the stream is connected and ready, send the next packet from tcpq */
+        printf("dohfd POLLOUT, extract next packet from tcpq\n");
 		int len;
 		void *buf = tcpq_dequeue(&len);
 		if (buf == NULL) {
@@ -590,6 +593,7 @@ void process_dohfd(uint32_t events) {
 				.data.ptr = &dohfd
 			};
 			/* cease to wait for POLLOUT if no more packets in tcpq */
+            printf("cease wating for pollout, tcpq empty\n");
 			epoll_ctl(epollfd, EPOLL_CTL_MOD, dohfd, &ev);
 		} else {
 			/* send the pkt and free the buf */
@@ -599,10 +603,12 @@ void process_dohfd(uint32_t events) {
 	}
 	if (events & POLLIN) {
 		/* POLLIN -> incoming reply */
+        printf("dohfd POLLIN, reply from remote server\n");
 		static struct dohdata dd;
 		dd.fd = dohfd;
 		ssize_t rlen = tcp_doh_recv(&dd);
 		if (rlen <= 0) {
+            printf("error tcp_doh_recv\n");
 			dohfd = -1;
 			close(dd.fd);
 			if (dd.buf) free(dd.buf);
@@ -618,12 +624,14 @@ void process_dohfd(uint32_t events) {
 				if (clientid >= 0) {
 					iothdns_rewrite_header(pkt, clientid, h.flags);
 					struct iovec pktbuf = iothdns_getbuf(pkt);
-#if FWD_PKT_DUMP
-					printf("%d %d\n",h.id,clientid);
+			
+                    printf("%d %d\n",h.id,clientid);
 					printf("========<<<<<<<<<<<<\n");
 					packetdump(stdout, pktbuf.iov_base, pktbuf.iov_len);
-#endif
-					dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0);
+                    
+                    /* TODO differentiate between upd and tcp request from rstack*/
+					dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0); 
+			        //ioth_sendmsg(urfd, &h, 0);
 				}
 				iothdns_free(pkt);
 				dd.len = dd.pos = 0;
@@ -702,6 +710,7 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
 	fwdaddr_count = _fwdaddr_count;
 
 	struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
+    
     init_ssl_ctx();
 
 	retval = urfd = ioth_msocket(rstack, AF_INET6, SOCK_DGRAM, 0);
@@ -734,21 +743,28 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
 			cleaning(newnow);
 		} else for (int i = 0; i < nfd; i++) {
 			struct epoll_event *event = &ev[i];
-			if (event->data.ptr == &urfd)          // UDP client request
-				process_urfd();
-			else if (event->data.ptr == &uffd)     // UDP reply from the server
-				process_uffd();
-			else if (event->data.ptr == &tlfd)     // TCP new client connection
-				process_tlfd();
-			else if (event->data.ptr == &tffd[0])     // TCP data from the server 0
-				process_tffd(0, event->events);
-			else if (event->data.ptr == &tffd[1])     // TCP data from the server 1
-				process_tffd(1, event->events);
-			else if (event->data.ptr == &tffd[2])     // TCP data from the server 2
-				process_tffd(2, event->events);
-			else                                   // TCP data from a client
-				process_trfd(event->data.ptr);
-		}
+            if (event->data.ptr == &urfd){
+                // UDP client request
+                printf("udp request from rstack");
+                process_urfd();
+            }   
+            else if (event->data.ptr == &uffd)     // UDP reply from the server
+                process_uffd();
+            else if (event->data.ptr == &tlfd)     // TCP new client connection
+                process_tlfd();
+            else if (event->data.ptr == &tffd[0])     // TCP data from the server 0
+                process_tffd(0, event->events);
+            else if (event->data.ptr == &tffd[1])     // TCP data from the server 1
+                process_tffd(1, event->events);
+            else if (event->data.ptr == &tffd[2])     // TCP data from the server 2
+                process_tffd(2, event->events);
+            else if (event->data.ptr == &dohfd){
+                printf("TCP data from doh server");
+                process_dohfd(event->events);
+            }
+            else                                   // TCP data from a client
+                process_trfd(event->data.ptr);
+        }
 	}
 	return 0;
 }

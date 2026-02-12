@@ -6,7 +6,6 @@ rstack    ip=192.168.1.24/24
 fstack    stack=kernel
 
 dns       8.8.8.8
-dns       80.80.80.80
 
 net       local 192.168.1.0/24
 auth      accept local
