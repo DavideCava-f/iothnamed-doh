@@ -58,4 +58,7 @@ void dnsreq_delfd(int fd, delcb *cb, void *arg);
 /* delete all the expired queries */
 void dnsreq_clean(time_t now, delcb *cb, void *arg);
 
+/* refresh the expiry of a pending query (e.g. when actually sent via DoH) */
+void dnsreq_refresh_expire(uint16_t serverid);
+
 #endif

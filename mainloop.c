@@ -93,7 +93,7 @@ int doh_wrap_dns_req(char* http_req, size_t http_req_max_len, char* buf, size_t 
             "Content-Type: application/dns-message\r\n"
             "Accept: application/dns-message\r\n"
             "Content-Length: %zu\r\n"
-            "Connection: close\r\n" // Or "keep-alive" if you plan to reuse the WolfSSL session
+            "Connection: keep-alive\r\n" // Or "keep-alive" if you plan to reuse the WolfSSL session
             "\r\n",
             remote_server, len
             );
@@ -250,8 +250,12 @@ void process_urfd(void) {
             
             printf("Forwarding request to fstack\n");
             if(USE_DOH){
-                tcpq_enqueue(buf, len);
-                wake_doh();
+                void *bufcopy = malloc(len);
+                if (bufcopy) {
+                    memcpy(bufcopy, buf, len);
+                    tcpq_enqueue(bufcopy, len);
+                    wake_doh();
+                }
             }else{
 			    ioth_sendto(uffd, buf, len, 0, (struct sockaddr *)&sfwd, sizeof(sfwd));
             }
@@ -441,6 +445,16 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
         /* Check for end of headers */
         char *body_start = strstr(dd->hdr_buf, "\r\n\r\n");
         if (body_start) {
+            /* The status line is the first line: "HTTP/1.1 200 OK" */
+            if (strstr(dd->hdr_buf, "HTTP/1.1 200") == NULL && 
+                    strstr(dd->hdr_buf, "HTTP/1.0 200") == NULL) {
+
+                printf("ERROR: DoH Server returned error (Not 200 OK):\n%.*s\n", 
+                        (int)(strchr(dd->hdr_buf, '\r') - dd->hdr_buf), dd->hdr_buf);
+
+                errno = EPROTO; 
+                return -1;
+            }
             long content_len = parse_content_length(dd->hdr_buf);
             
             if (content_len < 0) {
@@ -569,11 +583,12 @@ void process_trfd(void *data) {
 				iothdns_free(rpkt);
 			} else {
 				/* forward the packet */
+                printf("client id inserted: %d\n", h.id);
 				int serverid = dnsreq_put(h.id, h.qname, h.qtype, td->fd, NULL);
 				if (serverid >= 0) {
-                    if(!USE_DOH){
-					    iothdns_rewrite_header(pkt, serverid, h.flags);
-                    }
+                    printf("server id: %d\n", serverid);
+				    iothdns_rewrite_header(pkt, serverid, h.flags);
+                    
 #if FWD_PKT_DUMP
 					printf("%d %d\n",h.id,serverid);
 					printf("========>>>>>>>>>>>>\n");
@@ -617,8 +632,19 @@ void process_dohfd(uint32_t events) {
                 epoll_ctl(epollfd, EPOLL_CTL_MOD, dohfd, &ev);
                 return;
             }
+            // Handshake failed with an error
+            fprintf(stderr, "TLS handshake failed\n");
+            epoll_ctl(epollfd, EPOLL_CTL_DEL, dohfd, NULL);
+            wolfSSL_free(dohssl);
+            ioth_close(dohfd);
+            dohssl = NULL;
+            dohfd = -1;
             return;
         }
+        /* Handshake just completed. Don't process POLLIN yet —
+           there's no DNS response pending, only send queued data. */
+        printf("TLS handshake complete\n");
+        events &= ~POLLIN;
     }
     if (events & POLLOUT) {
         if (wolfSSL_is_init_finished(dohssl)){
@@ -637,6 +663,11 @@ void process_dohfd(uint32_t events) {
             } else {
                 /* send the pkt and free the buf */
                 tcp_doh_send(dohssl, buf, len, "dns.google"); //TODO fix with fwdaddr
+                /* refresh the dnsreq expiry — the timeout should count from actual send, not enqueue */
+                if (len >= 2) {
+                    uint16_t serverid = ((uint8_t *)buf)[0] << 8 | ((uint8_t *)buf)[1];
+                    dnsreq_refresh_expire(serverid);
+                }
                 free(buf);
             }
         }
@@ -648,153 +679,182 @@ void process_dohfd(uint32_t events) {
 		static struct dohdata dd;
 		dd.fd = dohfd;
         dd.ssl = dohssl;
-		ssize_t rlen = tcp_doh_recv(&dd);
-		if (rlen <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                printf("partial read\n");
-                return;
-            }else{
-                printf("transmission finished, closing connection\n");
+        for(;;){
+            ssize_t rlen = tcp_doh_recv(&dd);
+            if (rlen < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    printf("partial read\n");
+                    break;
+                } 
+                printf("Fatal Error or Connection Closed (Error)\n");
                 dohfd = -1;
                 close(dd.fd);
                 if (dd.buf) free(dd.buf);
+                return;
+            } 
+            if(rlen == 0) {
+                printf("Connection closed by peer\n");
+                dohfd = -1;
+                close(dd.fd);
+                if (dd.buf) free(dd.buf);
+                return;
             }
-        } else if (dd.pos == dd.len) {
-            printf("read full packet, buf: %s\n", dd.buf);
-            printf("========<<<<<<<<<<<<\n");
-            packetdump(stdout, dd.buf, dd.len);
+            if (dd.pos == dd.len) {
+                printf("read full packet, buf:\n");
+                printf("========<<<<<<<<<<<<\n");
+                packetdump(stdout, dd.buf, dd.len);
 
-            struct iothdns_header h;
-            char qnamebuf[IOTHDNS_MAXNAME];
-            struct iothdns_pkt *pkt = iothdns_get_header(&h, dd.buf, dd.len, qnamebuf);
-            if (pkt) {
-                printf("iothdns_pkt not null\n");
-                int fd;
-                if (auth_isactive(AUTH_CACHE))
-                    cache_feed(pkt);
-                int clientid = dnsreq_get(h.id, h.qname, h.qtype, &fd, NULL);
-                printf("clientid: %d\n", clientid);
-                if (clientid >= 0) {
-                    iothdns_rewrite_header(pkt, clientid, h.flags);
+                struct iothdns_header h;
+                char qnamebuf[IOTHDNS_MAXNAME];
+                struct iothdns_pkt *pkt = iothdns_get_header(&h, dd.buf, dd.len, qnamebuf);
+                if (pkt) {
+                    printf("iothdns_pkt not null\n");
+                    int fd;
+                    uint8_t ctlbuf[CMSG_PKTINFO_SIZE];
+                    struct sockaddr_in6 sock;
                     struct iovec pktbuf = iothdns_getbuf(pkt);
+                    struct msghdr msghdr = {
+                        .msg_name = &sock,
+                        .msg_namelen = sizeof(sock),
+                        .msg_iov = &pktbuf,
+                        .msg_iovlen = 1,
+                        .msg_control = ctlbuf,
+                        .msg_controllen = sizeof(ctlbuf),
+                    };
+                    printf("serverid: %d\n", h.id);
+                    int clientid = dnsreq_get(h.id, h.qname, h.qtype, &fd, &msghdr);
+                    printf("clientid: %d\n", clientid);
+                    if (clientid >= 0) {
+                        iothdns_rewrite_header(pkt, clientid, h.flags);
+                        pktbuf = iothdns_getbuf(pkt);
 
-                    printf("%d %d\n",h.id,clientid);
-                    printf("========<<<<<<<<<<<<\n");
-                    packetdump(stdout, pktbuf.iov_base, pktbuf.iov_len);
+                        printf("%d %d\n",h.id,clientid);
+                        printf("========<<<<<<<<<<<<\n");
+                        packetdump(stdout, pktbuf.iov_base, pktbuf.iov_len);
 
-                    dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0); 
-                    //ioth_sendmsg(urfd, &h, 0);
+                        if (fd == urfd) {
+                            ioth_sendmsg(urfd, &msghdr, 0);
+                        } else {
+                            dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0);
+                        }
+                    }
                 }
-            iothdns_free(pkt);
-            dd.len = dd.pos = 0;
-            free(dd.buf);
-            dd.buf = NULL;
+                iothdns_free(pkt);
+                /* Reset dohdata for next response */
+                free(dd.buf);
+                memset(&dd, 0, sizeof(dd));
+                dd.ssl = dohssl;
+                dd.fd = dohfd;
+
+                continue;
+            }
+
+            break;
         }
-		}
-	}
+    }
 }
 
 
 /* POLLIN event from a TCP remote DNS server (reply to a forwarded request) */
 void process_tffd(int index, uint32_t events) {
-	if (events & POLLOUT) {
-		/* POLLOUT event, the stream is connected and ready, send the next packet from tcpq */
-		int len;
-		void *buf = tcpq_dequeue(&len);
-		if (buf == NULL) {
-			struct epoll_event ev = {
-				.events=POLLIN,
-				.data.ptr = &tffd[index]
-			};
-			/* cease to wait for POLLOUT if no more packets in tcpq */
-			epoll_ctl(epollfd, EPOLL_CTL_MOD, tffd[index], &ev);
-		} else {
-			/* send the pkt and free the buf */
-			dns_tcp_send(tffd[index], buf, len, 0);
-			free(buf);
-		}
-	}
-	if (events & POLLIN) {
-		/* POLLIN -> incoming reply */
-		static struct tcpdata td[IOTHDNS_MAXNS];
-		td[index].fd = tffd[index];
-		ssize_t rlen = dns_tcp_recv(&td[index]);
-		if (rlen <= 0) {
-			tffd[index] = -1;
-			close(td[index].fd);
-			if (td[index].buf) free(td[index].buf);
-		} else if (td[index].pos == td[index].len) {
-			struct iothdns_header h;
-			char qnamebuf[IOTHDNS_MAXNAME];
-			struct iothdns_pkt *pkt = iothdns_get_header(&h, td[index].buf, td[index].len, qnamebuf);
-			if (pkt) {
-				int fd;
-				if (auth_isactive(AUTH_CACHE))
-					cache_feed(pkt);
-				int clientid = dnsreq_get(h.id, h.qname, h.qtype, &fd, NULL);
-				if (clientid >= 0) {
-					iothdns_rewrite_header(pkt, clientid, h.flags);
-					struct iovec pktbuf = iothdns_getbuf(pkt);
+    if (events & POLLOUT) {
+        /* POLLOUT event, the stream is connected and ready, send the next packet from tcpq */
+        int len;
+        void *buf = tcpq_dequeue(&len);
+        if (buf == NULL) {
+            struct epoll_event ev = {
+                .events=POLLIN,
+                .data.ptr = &tffd[index]
+            };
+            /* cease to wait for POLLOUT if no more packets in tcpq */
+            epoll_ctl(epollfd, EPOLL_CTL_MOD, tffd[index], &ev);
+        } else {
+            /* send the pkt and free the buf */
+            dns_tcp_send(tffd[index], buf, len, 0);
+            free(buf);
+        }
+    }
+    if (events & POLLIN) {
+        /* POLLIN -> incoming reply */
+        static struct tcpdata td[IOTHDNS_MAXNS];
+        td[index].fd = tffd[index];
+        ssize_t rlen = dns_tcp_recv(&td[index]);
+        if (rlen <= 0) {
+            tffd[index] = -1;
+            close(td[index].fd);
+            if (td[index].buf) free(td[index].buf);
+        } else if (td[index].pos == td[index].len) {
+            struct iothdns_header h;
+            char qnamebuf[IOTHDNS_MAXNAME];
+            struct iothdns_pkt *pkt = iothdns_get_header(&h, td[index].buf, td[index].len, qnamebuf);
+            if (pkt) {
+                int fd;
+                if (auth_isactive(AUTH_CACHE))
+                    cache_feed(pkt);
+                int clientid = dnsreq_get(h.id, h.qname, h.qtype, &fd, NULL);
+                if (clientid >= 0) {
+                    iothdns_rewrite_header(pkt, clientid, h.flags);
+                    struct iovec pktbuf = iothdns_getbuf(pkt);
 #if FWD_PKT_DUMP
-					printf("%d %d\n",h.id,clientid);
-					printf("========<<<<<<<<<<<<\n");
-					packetdump(stdout, pktbuf.iov_base, pktbuf.iov_len);
+                    printf("%d %d\n",h.id,clientid);
+                    printf("========<<<<<<<<<<<<\n");
+                    packetdump(stdout, pktbuf.iov_base, pktbuf.iov_len);
 #endif
-					dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0);
-				}
-				iothdns_free(pkt);
-				td[index].len = td[index].pos = 0;
-				free(td[index].buf);
-				td[index].buf = NULL;
-			}
-		}
-	}
+                    dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0);
+                }
+                iothdns_free(pkt);
+                td[index].len = td[index].pos = 0;
+                free(td[index].buf);
+                td[index].buf = NULL;
+            }
+        }
+    }
 }
 
 #define NEVENTS 8
 
 int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdaddr, int _fwdaddr_count) {
-	int retval;
-	int on = 1;
-	rstack = _rstack;
-	fstack = _fstack;
-	fwdaddr = _fwdaddr;
-	fwdaddr_count = _fwdaddr_count;
+    int retval;
+    int on = 1;
+    rstack = _rstack;
+    fstack = _fstack;
+    fwdaddr = _fwdaddr;
+    fwdaddr_count = _fwdaddr_count;
 
-	struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
-    
+    struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
+
     init_ssl_ctx();
 
-	retval = urfd = ioth_msocket(rstack, AF_INET6, SOCK_DGRAM, 0);
-	ckretval(retval, "udp request fd msocket");
-	retval = ioth_bind(urfd, (struct sockaddr *)&scli, sizeof(scli));
-	ckretval(retval, "udp request fd bind");
-	ioth_setsockopt(urfd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on));
+    retval = urfd = ioth_msocket(rstack, AF_INET6, SOCK_DGRAM, 0);
+    ckretval(retval, "udp request fd msocket");
+    retval = ioth_bind(urfd, (struct sockaddr *)&scli, sizeof(scli));
+    ckretval(retval, "udp request fd bind");
+    ioth_setsockopt(urfd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on));
 
-	retval = tlfd = ioth_msocket(rstack, AF_INET6, SOCK_STREAM, 0);
-	ckretval(retval, "tcp listening fd msocket");
-	retval = ioth_bind(tlfd, (struct sockaddr *)&scli, sizeof(scli));
-	ckretval(retval, "tcp listening fd bind");
-	retval = ioth_listen(tlfd, tcp_listen_backlog);
-	ckretval(retval, "tcp listening fd listen");
+    retval = tlfd = ioth_msocket(rstack, AF_INET6, SOCK_STREAM, 0);
+    ckretval(retval, "tcp listening fd msocket");
+    retval = ioth_bind(tlfd, (struct sockaddr *)&scli, sizeof(scli));
+    ckretval(retval, "tcp listening fd bind");
+    retval = ioth_listen(tlfd, tcp_listen_backlog);
+    ckretval(retval, "tcp listening fd listen");
 
-	retval = uffd = ioth_msocket(fstack, AF_INET6, SOCK_DGRAM, 0);
-	ckretval(retval, "udp forward fd msocket");
-    
-	epollfd = epoll_create1(0);
-	epoll_ctl(epollfd, EPOLL_CTL_ADD, urfd, &((struct epoll_event){.events=POLLIN, .data.ptr = &urfd}));
-	epoll_ctl(epollfd, EPOLL_CTL_ADD, tlfd, &((struct epoll_event){.events=POLLIN, .data.ptr = &tlfd}));
-	epoll_ctl(epollfd, EPOLL_CTL_ADD, uffd, &((struct epoll_event){.events=POLLIN, .data.ptr = &uffd}));
+    retval = uffd = ioth_msocket(fstack, AF_INET6, SOCK_DGRAM, 0);
+    ckretval(retval, "udp forward fd msocket");
 
-	while (alive()) {
-		struct epoll_event ev[NEVENTS];
-		int nfd = epoll_wait(epollfd, ev, NEVENTS, ms_to_nexttick());
-		if (nfd == 0) {
-			// new sec: cleaning actions
-			time_t newnow = tick();
-			cleaning(newnow);
-		} else for (int i = 0; i < nfd; i++) {
-			struct epoll_event *event = &ev[i];
+    epollfd = epoll_create1(0);
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, urfd, &((struct epoll_event){.events=POLLIN, .data.ptr = &urfd}));
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, tlfd, &((struct epoll_event){.events=POLLIN, .data.ptr = &tlfd}));
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, uffd, &((struct epoll_event){.events=POLLIN, .data.ptr = &uffd}));
+
+    while (alive()) {
+        struct epoll_event ev[NEVENTS];
+        int nfd = epoll_wait(epollfd, ev, NEVENTS, ms_to_nexttick());
+        if (nfd == 0) {
+            // new sec: cleaning actions
+            time_t newnow = tick();
+            cleaning(newnow);
+        } else for (int i = 0; i < nfd; i++) {
+            struct epoll_event *event = &ev[i];
             if (event->data.ptr == &urfd){
                 // UDP client request
                 printf("udp request from rstack");
@@ -817,19 +877,19 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
             else                                   // TCP data from a client
                 process_trfd(event->data.ptr);
         }
-	}
-	return 0;
+    }
+    return 0;
 }
 
 void mainloop_set_hashttl(int ttl) {
-	process_dns_req_set_hashttl(ttl);
+    process_dns_req_set_hashttl(ttl);
 }
 
 void mainloop_set_tcp_listen_backlog(int backlog) {
-	if (backlog >= 0)
-		tcp_listen_backlog = backlog;
+    if (backlog >= 0)
+        tcp_listen_backlog = backlog;
 }
 
 void mainloop_set_tcp_timeout(int timeout) {
-	fd_timeout_set(timeout);
+    fd_timeout_set(timeout);
 }
