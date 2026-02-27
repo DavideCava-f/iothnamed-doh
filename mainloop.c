@@ -469,11 +469,16 @@ int doh_wrap_dns_req(char* http_req, size_t http_req_max_len, char* buf, size_t 
 }
 
 void close_doh_connection(struct dohdata* dd, char* message, int loginfo){
-
     printlog(loginfo, message);
+    epoll_ctl(epollfd, EPOLL_CTL_DEL, dohfd, NULL);
+    if (dohssl) {
+        wolfSSL_free(dohssl);
+        dohssl = NULL;
+    }
+    ioth_close(dohfd);
     dohfd = -1;
-    close(dd->fd);
     if (dd->buf) free(dd->buf);
+    memset(dd, 0, sizeof(*dd));
 }
 
 
@@ -481,7 +486,7 @@ void close_doh_connection(struct dohdata* dd, char* message, int loginfo){
 
 int doh_ssl_recv_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     int fd = (int)(intptr_t)ctx;
-    int ret = ioth_recv(fd, buf, sz, 0);
+    int ret = ioth_recv(fd, buf, sz, MSG_DONTWAIT);
     if (ret < 0) {
         int err = errno;
         if (err == EAGAIN || err == EWOULDBLOCK)
@@ -489,6 +494,8 @@ int doh_ssl_recv_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 
         return WOLFSSL_CBIO_ERR_GENERAL;
     }
+    if (ret == 0)
+        return WOLFSSL_CBIO_ERR_CONN_CLOSE;
     return ret;
 }
 
