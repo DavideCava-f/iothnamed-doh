@@ -113,6 +113,7 @@ int dnsreq_put(uint16_t clientid, const char *name, uint16_t qtype,
 	nl_list_add_tail(&new->reqq, &reqq);
 	nl_list_add_tail(&new->fdlist, &fdhash[fd % FDHASH]);
 	reqtab[serverid % MAXREQ] = new;
+    struct dnsreq* this = reqtab[serverid % MAXREQ];
 	pthread_mutex_unlock(&reqmutex);
 	return serverid;
 }
@@ -124,13 +125,33 @@ static void dnsreq_del(struct dnsreq *this) {
 	free(this);
 }
 
+void dnsreq_refresh_expire(uint16_t serverid) {
+	pthread_mutex_lock(&reqmutex);
+	struct dnsreq *this = reqtab[serverid % MAXREQ];
+	if (this != NULL && this->serverid == serverid) {
+		/* Move to tail of reqq (it's sorted by expire time) */
+		nl_list_del(&this->reqq);
+		this->expire = now() + TIMEOUT;
+		nl_list_add_tail(&this->reqq, &reqq);
+	}
+	pthread_mutex_unlock(&reqmutex);
+}
+
 int dnsreq_get(uint16_t serverid, const char *name, uint16_t qtype,
 		int *fd, struct msghdr *msg) {
-	struct dnsreq *this = reqtab[serverid % MAXREQ];
 	pthread_mutex_lock(&reqmutex);
+	struct dnsreq *this = reqtab[serverid % MAXREQ];
 	if (this == NULL || qtype != this->qtype || serverid != this->serverid ||
-			simple_stringhash(name) != this->namehash)
+			simple_stringhash(name) != this->namehash) {
+		if (this == NULL) {
+			printf("*this == NULL (serverid=%u, slot=%u)\n", serverid, serverid % MAXREQ);
+		} else {
+			if (qtype != this->qtype) printf("this->qtype != qtype\n");
+			if (serverid != this->serverid) printf("this->serverid != serverid\n");
+			if (simple_stringhash(name) != this->namehash) printf("hash mismatch\n");
+		}
 		err_return(ENOENT);
+	}
 	uint16_t clientid = this->clientid;
 	if (msg != NULL) {
 		if (this->salen <= msg->msg_namelen) {
@@ -152,12 +173,12 @@ int dnsreq_get(uint16_t serverid, const char *name, uint16_t qtype,
 
 void dnsreq_delfd(int fd, delcb *cb, void *arg) {
 	struct dnsreq *scan, *tmp;
-	pthread_mutex_unlock(&reqmutex);
+	pthread_mutex_lock(&reqmutex); // WAS UNLOCK BEFORE NOT SURE IF IT IS A BUG
 	nl_list_for_each_entry_safe(scan, tmp, &fdhash[fd % FDHASH], fdlist) {
 		if (scan->fd == fd) {
 			if (cb)
 				cb(scan->fd, scan->salen ? scan->sa : NULL, scan->salen, arg);
-			// printf("DELFD %d %d\n", scan->clientid, scan->serverid);
+		    printf("DELFD %d %d\n", scan->clientid, scan->serverid);
 			dnsreq_del(scan);
 		}
 	}
@@ -166,12 +187,12 @@ void dnsreq_delfd(int fd, delcb *cb, void *arg) {
 
 void dnsreq_clean(time_t now, delcb *cb, void *arg) {
 	struct dnsreq *scan, *tmp;
-	pthread_mutex_unlock(&reqmutex);
+	pthread_mutex_lock(&reqmutex); // WAS UNLOCK BEFORE NOT SURE IF IT IS A BUG
 	nl_list_for_each_entry_safe(scan, tmp, &reqq, reqq) {
 		if (scan->expire < now) {
 			if (cb)
 				cb(scan->fd, scan->salen ? scan->sa : NULL, scan->salen, arg);
-			// printf("DEL %d %d\n", scan->clientid, scan->serverid);
+			printf("CLEAN_DEL clientid=%d serverid=%d (expire=%ld now=%ld)\n", scan->clientid, scan->serverid, (long)scan->expire, (long)now);
 			dnsreq_del(scan);
 		} else
 			break;
