@@ -1,4 +1,5 @@
 # iothnamed:
+## ⚠️ DNS over HTTPS experimental implementation ⚠️
 ### a DNS server/forwarder/cache for the Internet of Threads
 
 `iothnamed` is a DNS server/forwarder/cache for the Internet of Threads supporting
