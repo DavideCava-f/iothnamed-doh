@@ -1,0 +1,8 @@
+- accetta richieste di tutti i tipi (53 443) contemporaneamente
+- fare dohlfd simil tlfd
+  - apre connessione ssl
+- fare process_dohrfd simil process_trfd
+  - accetta richieste https quindi parsing complesso
+  - deve dare risposte in formato doh
+  - standard http response cose
+- bisogna controllare bene il flusso dei pacchetti delle richieste dai client

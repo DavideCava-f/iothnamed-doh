@@ -61,6 +61,11 @@
 	} \
 } while (0)
 
+enum client_type {
+    TCP_CLIENT,
+    DOH_CLIENT
+};
+
 static struct ioth *rstack; // req stack
 static struct ioth *fstack; // fwd stack
 static struct in6_addr *fwdaddr;
@@ -80,14 +85,18 @@ static int uffd = -1;  // udp forward fd
 static int tlfd = -1;  // tcp listen fd
 static int tffd[IOTHDNS_MAXNS] = {-1, -1, -1};  // tcp forward fd
 
-static int dohfd = -1;
+static int dohfd = -1; //TODO rename dohffd
 static WOLFSSL *dohssl;
 static WOLFSSL_CTX *doh_ctx;
+
+static int dohlfd = -1; //listening for https requests
+static WOLFSSL_CTX *doh_server_ctx;
 
 static int tcp_listen_backlog = 5;
 
 // DOH
 struct dohdata {
+    enum client_type ctype;
     WOLFSSL *ssl;
     int fd;
 
@@ -100,18 +109,21 @@ struct dohdata {
     size_t pos; 
 };
 
-/* DOH function prototypes */
+/* DOH forward function prototypes */
 int doh_wrap_dns_req(char *http_req, size_t http_req_max_len, char *buf, size_t len, const char *remote_server);
 void close_doh_connection(struct dohdata *dd, char *message, int loginfo);
 int doh_ssl_recv_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx);
 int doh_ssl_send_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx);
-void init_ssl_ctx(void);
+void init_ssl_ctx(); 
 static int wake_doh(void);
 static long parse_content_length(const char *headers);
 ssize_t tcp_doh_recv(struct dohdata *dd);
 ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, const char *hostname);
 void process_dohfd(uint32_t events);
 
+/* DOH listening function prototypes */
+void process_dohlfd(void); // listen for https requests and open ssl connection if needed
+void process_dohrfd(event->data.ptr, event->events); 
 
 static void tcp_timeout_cb(int fd) {
 	ioth_shutdown(fd, SHUT_RDWR);
@@ -253,6 +265,7 @@ static ssize_t dns_tcp_send(int fd, void *buf, size_t len, int flags) {
  */
 
 struct tcpdata {
+    enum client_type ctype;
 	int fd;
 	uint16_t len;  /* len of the current request */
 	uint16_t pos;  /* offset for reading the remaining part of the request */
@@ -292,6 +305,7 @@ void process_tlfd(void) {
 		else {
 			struct tcpdata *td = calloc(1, sizeof(*td));
 			td->fd = connfd;
+            td->ctype = TCP_CLIENT;
 			fd_timeout_add(now(), connfd);
 			epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &((struct epoll_event){.events=POLLIN, .data.ptr = td}));
 		}
@@ -512,7 +526,7 @@ int doh_ssl_send_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 void init_ssl_ctx() {
     wolfSSL_Init();
     doh_ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
-    
+
     if(!doh_ctx) {
         printlog(LOG_ERR,"Failed to initialize ssl context");
         //exit(0);
@@ -522,6 +536,7 @@ void init_ssl_ctx() {
     wolfSSL_SetIOSend(doh_ctx, doh_ssl_send_cb);
     printlog(LOG_INFO,"SSL context correctly initialized");
 }
+
 
 static int wake_doh(void) {
 	/* if the connection to the server is not active, do a asynch connect */
@@ -832,7 +847,8 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
 
     struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
 
-    init_ssl_ctx();
+    init_ssl_ctx(); 
+    init_ssl_server_ctx();
 
     retval = urfd = ioth_msocket(rstack, AF_INET6, SOCK_DGRAM, 0);
     ckretval(retval, "udp request fd msocket");
@@ -882,8 +898,14 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
             else if (event->data.ptr == &dohfd){
                 process_dohfd(event->events);
             }
-            else                                   // TCP data from a client
-                process_trfd(event->data.ptr);
+            else {
+                enum client_type *ctype = (enum client_type *)event->data.ptr;
+                if (*ctype == CLIENT_TCP) {
+                    process_trfd(event->data.ptr);
+                } else if (*ctype == CLIENT_DOH) {
+                    process_dohrfd(event->data.ptr, event->events); 
+                }
+            }  
         }
     }
     return 0;
@@ -900,4 +922,89 @@ void mainloop_set_tcp_listen_backlog(int backlog) {
 
 void mainloop_set_tcp_timeout(int timeout) {
     fd_timeout_set(timeout);
+}
+
+
+/* doh server section */
+
+void process_dohlfd(void) {
+	struct sockaddr_in6 sock;
+	socklen_t socklen = sizeof(sock);
+	int connfd = ioth_accept(tlfd, (struct sockaddr *)&sock, &socklen);
+	if (connfd >= 0) {
+		if (authck(AUTH_ACCEPT, &sock.sin6_addr) == 0)
+			close(connfd);
+		else {
+			struct dohdata *dd = calloc(1, sizeof(*dd));
+			dd->fd = connfd;
+            dd->ctype = DOH_CLIENT;
+
+            dd->ssl = wolfSSL_new(doh_server_ctx);
+            
+            wolfSSL_SetIOReadCtx(dd->ssl, (void*)(intptr_t)connfd);
+            wolfSSL_SetIOWriteCtx(dd->ssl, (void*)(intptr_t)connfd);
+
+			fd_timeout_add(now(), connfd);
+			epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
+		}
+	}
+}
+
+void init_ssl_server_ctx() {
+    wolfSSL_Init();
+    doh_server_ctx = wolfSSL_CTX_new(wolfTLSv1_3_server_method());
+
+    if(!doh_server_ctx) {
+        printlog(LOG_ERR,"Failed to initialize ssl server context");
+    }
+
+    if (wolfSSL_CTX_use_certificate_file(doh_server_ctx, "server-cert.pem", SSL_FILETYPE_PEM) != SSL_SUCCESS) {
+        printlog(LOG_ERR, "Error loading server-cert.pem");
+    }
+    
+    if (wolfSSL_CTX_use_PrivateKey_file(doh_server_ctx, "server-key.pem", SSL_FILETYPE_PEM) != SSL_SUCCESS) {
+        printlog(LOG_ERR, "Error loading server-key.pem");
+    }
+    // bind calback functions
+    wolfSSL_SetIORecv(doh_server_ctx, doh_ssl_recv_cb);
+    wolfSSL_SetIOSend(doh_server_ctx, doh_ssl_send_cb);
+    printlog(LOG_INFO,"SSL context correctly initialized");
+}
+
+
+void process_dohrfd(void *data, uint32_t events) {
+    struct dohdata *dd = (struct dohdata *)data;
+
+    // If WolfSSL hasn't finished the handshake yet...
+    if (!wolfSSL_is_init_finished(dd->ssl)) {
+        int ret = wolfSSL_accept(dd->ssl); // Note: accept, not connect!
+        
+        if (ret != WOLFSSL_SUCCESS) {
+            int err = wolfSSL_get_error(dd->ssl, ret);
+            if (err == WOLFSSL_ERROR_WANT_READ) {
+                // Wait for POLLIN
+                epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
+                return;
+            } else if (err == WOLFSSL_ERROR_WANT_WRITE) {
+                // Wait for POLLOUT
+                epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLOUT, .data.ptr = dd}));
+                return;
+            }
+            // If it's another error, the handshake failed. Close connection.
+        }
+    }
+
+    // --- Handshake is finished! ---
+    
+    if (events & POLLIN) {
+        // Read the encrypted HTTP request from the client
+        // (Your logic here)
+        // forward to dohfd or check cache
+    }
+    
+    if (events & POLLOUT) {
+        // Write the encrypted HTTP response back to the client
+        // (Your logic here)
+        // if cache hit write https repsonse to client
+    }
 }
