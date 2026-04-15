@@ -107,6 +107,11 @@ struct dohdata {
     uint8_t *buf;         
     size_t len;  
     size_t pos; 
+
+    //just to be sure i dont override the response buffer
+    uint8_t *write_buf;  
+    size_t write_len;    
+    size_t write_pos;
 };
 
 /* DOH forward function prototypes */
@@ -125,6 +130,7 @@ void process_dohfd(uint32_t events);
 void process_dohlfd(void); // listen for https requests and open ssl connection if needed
 void process_dohrfd(void* data, uint32_t events); 
 void init_ssl_server_ctx(void);
+int doh_wrap_dns_resp(char *http_resp, size_t http_resp_max_len, char* buf, size_t buf_len);
 
 static void tcp_timeout_cb(int fd) {
 	ioth_shutdown(fd, SHUT_RDWR);
@@ -976,9 +982,9 @@ void init_ssl_server_ctx() {
 void process_dohrfd(void *data, uint32_t events) {
     struct dohdata *dd = (struct dohdata *)data;
 
-    // If WolfSSL hasn't finished the handshake yet...
+    // ensure handshake is finished
     if (!wolfSSL_is_init_finished(dd->ssl)) {
-        int ret = wolfSSL_accept(dd->ssl); // Note: accept, not connect!
+        int ret = wolfSSL_accept(dd->ssl); 
         
         if (ret != WOLFSSL_SUCCESS) {
             int err = wolfSSL_get_error(dd->ssl, ret);
@@ -995,17 +1001,144 @@ void process_dohrfd(void *data, uint32_t events) {
         }
     }
 
-    // --- Handshake is finished! ---
-    
+    // read from client
     if (events & POLLIN) {
-        // Read the encrypted HTTP request from the client
-        // (Your logic here)
-        // forward to dohfd or check cache
+        for(;;){
+            ssize_t rlen = tcp_doh_recv(&dd);
+            if (rlen < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    printf("partial read\n");
+                    break;
+                } 
+                close_doh_connection(&dd, "Fatal Error or Connection Close", LOG_ERR);
+                return;
+            } 
+            if(rlen == 0) {
+                close_doh_connection(&dd, "Connection Closed by Peer", LOG_INFO);
+                return;
+            }
+            if (dd.pos == dd.len) {
+                struct iothdns_header h;
+                char qnamebuf[IOTHDNS_MAXNAME];
+                struct iothdns_pkt *pkt = iothdns_get_header(&h, dd->buf, dd->len, qnamebuf);
+
+                if (pkt) {
+                    struct sockaddr_in6 sock;
+                    socklen_t socklen = sizeof(sock);
+                    getpeername(dd->fd, (struct sockaddr *)&sock, &socklen);
+                    fd_timeout_add(now(), dd->fd); 
+
+                    struct iothdns_pkt *rpkt = process_dns_req(&h, &sock.sin6_addr);
+                    if (rpkt != NULL) {
+                        struct iovec rpktbuf = iothdns_getbuf(rpkt);
+
+                        size_t max_resp_length = rpktbuf.iov_len + 512; //512bytes for https header
+                        dd->write_buf = malloc(max_resp_length);
+                        int total_len = doh_wrap_dns_resp((char *)dd->write_buf, max_resp_len, rpktbuf.iov_base, rpktbuf.iov_len);
+
+                        dd->write_len = total_len;
+                        dd->write_pos = 0;
+
+                        epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLIN | POLLOUT, .data.ptr = dd}));
+
+                        iothdns_free(rpkt);
+                    } else {
+                        // forward 
+                        printf("client id inserted: %d\n", h.id);
+                        int serverid = dnsreq_put(h.id, h.qname, h.qtype, dd->fd, NULL);
+                        if (serverid >= 0) {
+                            printf("server id: %d\n", serverid);
+                            iothdns_rewrite_header(pkt, serverid, h.flags);
+
+#if FWD_PKT_DUMP
+                            printf("%d %d\n",h.id,serverid);
+                            printf("========>>>>>>>>>>>>\n");
+                            packetdump(stdout, td->buf, td->len);
+#endif
+                            /* tcpq_enqueue delays the send to a POLLOUT event on the connection to the remote DNS server */
+                            /* the queue is shared: it is more a feature than a bug.
+                             * A fast server can steal requests intentionally for another server */
+                            tcpq_enqueue(dd->buf, dd->len);
+                            // why would i not use doh when receiving doh requests? lol
+                            if(USE_DOH) {
+                                wake_doh();
+                            }else{
+                                wake_tcp();
+                            }
+                            /* this avoids to free the buf, enqueued for the delayed sending */
+                            dd->buf = NULL;
+                        }
+                    }
+                    iothdns_free(rpkt);
+                }
+                free(dd->buf);
+                dd->buf = NULL;
+                dd->hdr_done = 0;
+                dd->hdr_pos = 0;
+                dd->pos = 0;
+                dd->len = 0;
+
+                // Continue the loop to see if a second HTTP request is waiting
+                continue;
+            }
+            break;
+        }
+
     }
-    
+
     if (events & POLLOUT) {
-        // Write the encrypted HTTP response back to the client
-        // (Your logic here)
-        // if cache hit write https repsonse to client
+        if (dd->write_buf != NULL && dd->write_pos < dd->write_len) {
+            int ret = wolfSSL_write(dd->ssl, dd->write_buf + dd->write_pos, dd->write_len - dd->write_pos);
+            
+            if (ret > 0) {
+                dd->write_pos += ret;
+                if (dd->write_pos == dd->write_len) {
+                    free(dd->write_buf);
+                    dd->write_buf = NULL;
+                    dd->write_len = 0;
+                    dd->write_pos = 0;
+                    
+                    // Reset read state for the next request (HTTP Keep-Alive)
+                    if (dd->buf) free(dd->buf);
+                    dd->buf = NULL;
+                    dd->hdr_done = 0;
+                    dd->hdr_pos = 0;
+                    dd->pos = 0;
+                    dd->len = 0;
+                    
+                    // Go back to only waiting for incoming data
+                    epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
+                }
+            } else {
+                int err = wolfSSL_get_error(dd->ssl, ret);
+                if (err != WOLFSSL_ERROR_WANT_WRITE && err != WOLFSSL_ERROR_WANT_READ) {
+                    printlog(LOG_ERR, "process_dohrfd: error writing response");
+                }
+            }
+        }    
     }
+}
+
+
+int doh_wrap_dns_resp(char *http_resp, size_t http_resp_max_len, char* buf, size_t buf_len) {
+    int header_len = snprintf(http_resp, http_resp_max_len,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/dns-message\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n",
+            len);
+    
+    if(header_len < 0 || header_len >= http_resp_max_len){
+        printlog(LOG_ERR, "doh-wrap-dns-resp: invalid header length");
+        return -1;
+    }
+
+    if(header_len + buf_len > http_resp_max_len){
+        printlog(LOG_ERR, "doh-wrap-dns-resp: buffer too small for full response");
+        return -1;
+    }
+
+    memcpy(http_resp + header_len, buf, buf_len);
+    return buf_len + header_len;
 }
