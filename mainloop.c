@@ -123,7 +123,8 @@ void process_dohfd(uint32_t events);
 
 /* DOH listening function prototypes */
 void process_dohlfd(void); // listen for https requests and open ssl connection if needed
-void process_dohrfd(event->data.ptr, event->events); 
+void process_dohrfd(void* data, uint32_t events); 
+void init_ssl_server_ctx(void);
 
 static void tcp_timeout_cb(int fd) {
 	ioth_shutdown(fd, SHUT_RDWR);
@@ -900,9 +901,9 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
             }
             else {
                 enum client_type *ctype = (enum client_type *)event->data.ptr;
-                if (*ctype == CLIENT_TCP) {
+                if (*ctype == TCP_CLIENT) {
                     process_trfd(event->data.ptr);
-                } else if (*ctype == CLIENT_DOH) {
+                } else if (*ctype == DOH_CLIENT) {
                     process_dohrfd(event->data.ptr, event->events); 
                 }
             }  
