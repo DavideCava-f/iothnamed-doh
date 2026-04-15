@@ -131,6 +131,7 @@ void process_dohlfd(void); // listen for https requests and open ssl connection 
 void process_dohrfd(void* data, uint32_t events); 
 void init_ssl_server_ctx(void);
 int doh_wrap_dns_resp(char *http_resp, size_t http_resp_max_len, char* buf, size_t buf_len);
+ssize_t tcp_doh_server_recv(struct dohdata *dd);
 
 static void tcp_timeout_cb(int fd) {
 	ioth_shutdown(fd, SHUT_RDWR);
@@ -554,9 +555,12 @@ static int wake_doh(void) {
 	if (dohfd < 0) {
         printlog(LOG_INFO,"doh - connection not active, performing asynch connect");
 		int retval;
+        printlog(LOG_INFO,"doh - creating socket");
 		struct sockaddr_in6 sfwd = {.sin6_family = AF_INET6, .sin6_addr = fwdaddr[fwdaddr_rr], .sin6_port = htons(HTTPS_PORT)};
-		retval = dohfd = ioth_msocket(fstack, AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
-		ckretval(retval, "doh forward fd msocket");
+		printlog(LOG_INFO,"doh - connecting to doh server");
+        retval = dohfd = ioth_msocket(fstack, AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+		printlog(LOG_INFO,"doh - socket created");
+        ckretval(retval, "doh forward fd msocket");
 		retval = ioth_connect(dohfd, (struct sockaddr *)&sfwd, sizeof(sfwd));
 		if (retval < 0 && errno != EINPROGRESS)
 			ckretval(retval, "tcp forward fd connect");
@@ -565,11 +569,14 @@ static int wake_doh(void) {
         wolfSSL_SetIOReadCtx(dohssl, (void*)(intptr_t)dohfd);
         wolfSSL_SetIOWriteCtx(dohssl, (void*)(intptr_t)dohfd);
         int res = wolfSSL_connect(dohssl);
+        printlog(LOG_INFO,"doh - SSL connect initiated");
 		epoll_ctl(epollfd, EPOLL_CTL_ADD, dohfd, &ev);
 	} else {
         printlog(LOG_INFO,"doh - connection active");
 		epoll_ctl(epollfd, EPOLL_CTL_MOD, dohfd, &ev);
     }
+
+    printlog(LOG_INFO,"doh - connection setup complete, round robin index before increment: %d", fwdaddr_rr);
 	fwdaddr_rr = (fwdaddr_rr + 1) % fwdaddr_count;
 	return 0;
 }
@@ -780,7 +787,7 @@ void process_dohfd(uint32_t events) {
             ssize_t rlen = tcp_doh_recv(&dd);
             if (rlen < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    printf("partial read\n");
+                    printf("partial read from google\n");
                     break;
                 } 
                 close_doh_connection(&dd, "Fatal Error or Connection Close", LOG_ERR);
@@ -845,6 +852,7 @@ void process_dohfd(uint32_t events) {
 #define NEVENTS 8
 
 int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdaddr, int _fwdaddr_count) {
+    printlog(LOG_INFO,"Starting mainloop");
     int retval;
     int on = 1;
     rstack = _rstack;
@@ -853,7 +861,7 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
     fwdaddr_count = _fwdaddr_count;
 
     struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
-
+    struct sockaddr_in6 scli_doh = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(HTTPS_PORT)};
     init_ssl_ctx(); 
     init_ssl_server_ctx();
 
@@ -870,12 +878,20 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
     retval = ioth_listen(tlfd, tcp_listen_backlog);
     ckretval(retval, "tcp listening fd listen");
 
+    retval = dohlfd = ioth_msocket(rstack, AF_INET6, SOCK_STREAM, 0);
+    ckretval(retval, "tcp listening fd msocket");
+    retval = ioth_bind(dohlfd, (struct sockaddr *)&scli_doh, sizeof(scli_doh));
+    ckretval(retval, "tcp listening fd bind");
+    retval = ioth_listen(dohlfd, tcp_listen_backlog);
+    ckretval(retval, "tcp listening fd listen");
+
     retval = uffd = ioth_msocket(fstack, AF_INET6, SOCK_DGRAM, 0);
     ckretval(retval, "udp forward fd msocket");
 
     epollfd = epoll_create1(0);
     epoll_ctl(epollfd, EPOLL_CTL_ADD, urfd, &((struct epoll_event){.events=POLLIN, .data.ptr = &urfd}));
     epoll_ctl(epollfd, EPOLL_CTL_ADD, tlfd, &((struct epoll_event){.events=POLLIN, .data.ptr = &tlfd}));
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, dohlfd, &((struct epoll_event){.events=POLLIN, .data.ptr = &dohlfd}));
     epoll_ctl(epollfd, EPOLL_CTL_ADD, uffd, &((struct epoll_event){.events=POLLIN, .data.ptr = &uffd}));
 
     while (alive()) {
@@ -896,6 +912,8 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
                 process_uffd();
             else if (event->data.ptr == &tlfd)     // TCP new client connection
                 process_tlfd();
+            else if (event->data.ptr == &dohlfd)   // DoH new client connection
+                process_dohlfd();
             else if (event->data.ptr == &tffd[0])     // TCP data from the server 0
                 process_tffd(0, event->events);
             else if (event->data.ptr == &tffd[1])     // TCP data from the server 1
@@ -937,7 +955,7 @@ void mainloop_set_tcp_timeout(int timeout) {
 void process_dohlfd(void) {
 	struct sockaddr_in6 sock;
 	socklen_t socklen = sizeof(sock);
-	int connfd = ioth_accept(tlfd, (struct sockaddr *)&sock, &socklen);
+	int connfd = ioth_accept(dohlfd, (struct sockaddr *)&sock, &socklen);
 	if (connfd >= 0) {
 		if (authck(AUTH_ACCEPT, &sock.sin6_addr) == 0)
 			close(connfd);
@@ -965,11 +983,11 @@ void init_ssl_server_ctx() {
         printlog(LOG_ERR,"Failed to initialize ssl server context");
     }
 
-    if (wolfSSL_CTX_use_certificate_file(doh_server_ctx, "server-cert.pem", SSL_FILETYPE_PEM) != SSL_SUCCESS) {
+    if (wolfSSL_CTX_use_certificate_file(doh_server_ctx, "../server-cert.pem", SSL_FILETYPE_PEM) != SSL_SUCCESS) {
         printlog(LOG_ERR, "Error loading server-cert.pem");
     }
     
-    if (wolfSSL_CTX_use_PrivateKey_file(doh_server_ctx, "server-key.pem", SSL_FILETYPE_PEM) != SSL_SUCCESS) {
+    if (wolfSSL_CTX_use_PrivateKey_file(doh_server_ctx, "../server-key.pem", SSL_FILETYPE_PEM) != SSL_SUCCESS) {
         printlog(LOG_ERR, "Error loading server-key.pem");
     }
     // bind calback functions
@@ -1004,20 +1022,20 @@ void process_dohrfd(void *data, uint32_t events) {
     // read from client
     if (events & POLLIN) {
         for(;;){
-            ssize_t rlen = tcp_doh_recv(&dd);
+            ssize_t rlen = tcp_doh_server_recv(dd);
             if (rlen < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    printf("partial read\n");
+                    printf("partial read dohrfd\n");
                     break;
                 } 
-                close_doh_connection(&dd, "Fatal Error or Connection Close", LOG_ERR);
+                close_doh_connection(dd, "Fatal Error or Connection Close", LOG_ERR);
                 return;
             } 
             if(rlen == 0) {
-                close_doh_connection(&dd, "Connection Closed by Peer", LOG_INFO);
+                close_doh_connection(dd, "Connection Closed by Peer", LOG_INFO);
                 return;
             }
-            if (dd.pos == dd.len) {
+            if (dd->pos == dd->len) {
                 struct iothdns_header h;
                 char qnamebuf[IOTHDNS_MAXNAME];
                 struct iothdns_pkt *pkt = iothdns_get_header(&h, dd->buf, dd->len, qnamebuf);
@@ -1034,7 +1052,7 @@ void process_dohrfd(void *data, uint32_t events) {
 
                         size_t max_resp_length = rpktbuf.iov_len + 512; //512bytes for https header
                         dd->write_buf = malloc(max_resp_length);
-                        int total_len = doh_wrap_dns_resp((char *)dd->write_buf, max_resp_len, rpktbuf.iov_base, rpktbuf.iov_len);
+                        int total_len = doh_wrap_dns_resp((char *)dd->write_buf, max_resp_length, rpktbuf.iov_base, rpktbuf.iov_len);
 
                         dd->write_len = total_len;
                         dd->write_pos = 0;
@@ -1044,8 +1062,10 @@ void process_dohrfd(void *data, uint32_t events) {
                         iothdns_free(rpkt);
                     } else {
                         // forward 
+                        printlog(LOG_INFO,"forwarding dns request to remote server");
                         printf("client id inserted: %d\n", h.id);
                         int serverid = dnsreq_put(h.id, h.qname, h.qtype, dd->fd, NULL);
+                        printlog(LOG_INFO,"dnsreq_put returned serverid: %d", serverid);
                         if (serverid >= 0) {
                             printf("server id: %d\n", serverid);
                             iothdns_rewrite_header(pkt, serverid, h.flags);
@@ -1065,19 +1085,19 @@ void process_dohrfd(void *data, uint32_t events) {
                             }else{
                                 wake_tcp();
                             }
-                            /* this avoids to free the buf, enqueued for the delayed sending */
-                            dd->buf = NULL;
+                            printlog(LOG_INFO,"dns request forwarded to remote server, waiting for response");
                         }
                     }
-                    iothdns_free(rpkt);
                 }
                 free(dd->buf);
+                printlog(LOG_INFO,"freeing dd->buf and resetting state for next request");
                 dd->buf = NULL;
+                printlog(LOG_INFO,"resetting dd->hdr_done, dd->hdr_pos, dd->pos, dd->len");
                 dd->hdr_done = 0;
                 dd->hdr_pos = 0;
                 dd->pos = 0;
                 dd->len = 0;
-
+                printlog(LOG_INFO,"packet done, waiting for next request on the same connection (HTTP Keep-Alive)");
                 // Continue the loop to see if a second HTTP request is waiting
                 continue;
             }
@@ -1127,7 +1147,7 @@ int doh_wrap_dns_resp(char *http_resp, size_t http_resp_max_len, char* buf, size
             "Content-Length: %zu\r\n"
             "Connection: keep-alive\r\n"
             "\r\n",
-            len);
+            buf_len);
     
     if(header_len < 0 || header_len >= http_resp_max_len){
         printlog(LOG_ERR, "doh-wrap-dns-resp: invalid header length");
@@ -1141,4 +1161,88 @@ int doh_wrap_dns_resp(char *http_resp, size_t http_resp_max_len, char* buf, size
 
     memcpy(http_resp + header_len, buf, buf_len);
     return buf_len + header_len;
+}
+
+ssize_t tcp_doh_server_recv(struct dohdata *dd) {
+    ssize_t rlen;
+
+    if (!dd->hdr_done) {
+        int max_read = sizeof(dd->hdr_buf) - dd->hdr_pos - 1; /* -1 for null terminator */
+        if (max_read <= 0) {
+            printlog(LOG_ERR,"ERROR: Server Header too large");
+            errno = EMSGSIZE; 
+            return -1;
+        }
+        
+        rlen = wolfSSL_read(dd->ssl, dd->hdr_buf + dd->hdr_pos, max_read);
+        if (rlen <= 0) {
+            int err  = wolfSSL_get_error(dd->ssl, rlen);
+            if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
+                errno = EAGAIN;
+                return -1;
+            }
+            return -1; 
+        }
+
+        dd->hdr_pos += rlen;
+        dd->hdr_buf[dd->hdr_pos] = '\0'; 
+
+        /* Check for end of headers */
+        char *body_start = strstr(dd->hdr_buf, "\r\n\r\n");
+        if (body_start) {
+            // ---> THE FIX: Check for a valid DoH POST request instead of 200 OK <---
+            if (strstr(dd->hdr_buf, "POST ") == NULL) {
+                printlog(LOG_ERR,"ERROR: Client sent invalid DoH request (Not POST):\n%.*s\n", 
+                        (int)(strchr(dd->hdr_buf, '\r') - dd->hdr_buf), dd->hdr_buf);
+                errno = EPROTO; 
+                return -1;
+            }
+            
+            long content_len = parse_content_length(dd->hdr_buf);
+            if (content_len < 0) {
+                printlog(LOG_ERR,"ERROR: valid https, missing Content-Length\n");
+                errno = EPROTO; 
+                return -1;
+            }
+
+            dd->len = (size_t)content_len;
+            dd->buf = malloc(dd->len);
+            if (!dd->buf) {
+                printlog(LOG_ERR,"ERROR: cannot allocate message buf");
+                errno = ENOMEM;
+                return -1;
+            }
+            dd->pos = 0;
+            dd->hdr_done = 1;
+
+            // Handle Body Over-read
+            int header_size = (body_start - dd->hdr_buf) + 4; 
+            int body_bytes_read = dd->hdr_pos - header_size;
+
+            if (body_bytes_read > 0) {
+                if ((size_t)body_bytes_read > dd->len) {
+                     body_bytes_read = dd->len;
+                }
+                memcpy(dd->buf, body_start + 4, body_bytes_read);
+                dd->pos += body_bytes_read;
+            }
+            
+            if (dd->pos == dd->len) {
+                return rlen; 
+            }
+        } else {
+             return rlen;
+        }
+    }
+
+    // Read DNS Body 
+    if (dd->hdr_done && dd->pos < dd->len) {
+        rlen = wolfSSL_read(dd->ssl, (char *)dd->buf + dd->pos, dd->len - dd->pos);
+        if (rlen <= 0) {
+            return rlen;
+        }
+        dd->pos += rlen;
+        return rlen;
+    }
+    return 0;
 }
