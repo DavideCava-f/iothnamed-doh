@@ -720,17 +720,22 @@ ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, const char *hostname) 
 
 
 void process_dohfd(uint32_t events) {
+    printlog(LOG_INFO,"process_dohfd called with events: %u", events);
+    printlog(LOG_INFO, "POLLIN: %s, POLLOUT: %s", (events & POLLIN) ? "YES" : "NO", (events & POLLOUT) ? "YES" : "NO");
     if (!wolfSSL_is_init_finished(dohssl)) {
         int ret = wolfSSL_connect(dohssl);
         if (ret < 0) {
+            printlog(LOG_INFO,"handshake in progress, ret=%d", ret);
             int err = wolfSSL_get_error(dohssl, ret);
             if (err == WOLFSSL_ERROR_WANT_READ) {
+                printlog(LOG_INFO,"Handshake needs to read: WANT_READ");
                 /* Handshake needs to read: Ensure we listen for POLLIN */
                 struct epoll_event ev = { .events = POLLIN, .data.ptr = &dohfd };
                 epoll_ctl(epollfd, EPOLL_CTL_MOD, dohfd, &ev);
                 return; 
             }
             if (err == WOLFSSL_ERROR_WANT_WRITE) {
+                printlog(LOG_INFO,"Handshake needs to write: WANT_WRITE");
                 /* Handshake needs to write: Ensure we listen for POLLOUT */
                 struct epoll_event ev = { .events = POLLIN | POLLOUT, .data.ptr = &dohfd };
                 epoll_ctl(epollfd, EPOLL_CTL_MOD, dohfd, &ev);
@@ -747,10 +752,14 @@ void process_dohfd(uint32_t events) {
         }
         /* Handshake just completed. Don't process POLLIN yet —
            there's no DNS response pending, only send queued data. */
-        printf("TLS handshake complete\n");
+        printlog(LOG_INFO,"DOHFD: TLS handshake completed");
         events &= ~POLLIN;
+        events |= POLLOUT; /* Force POLLOUT processing to send queued data */
+        epoll_ctl(epollfd, EPOLL_CTL_MOD, dohfd, &(struct epoll_event){.events = POLLOUT, .data.ptr = &dohfd});
+
     }
     if (events & POLLOUT) {
+        printlog(LOG_INFO,"dohfd POLLOUT event, is init finished? %s", wolfSSL_is_init_finished(dohssl) ? "YES" : "NO");
         if (wolfSSL_is_init_finished(dohssl)){
             /* POLLOUT event, the stream is connected and ready, send the next packet from tcpq */
             printf("dohfd POLLOUT, extract next packet from tcpq\n");
@@ -772,7 +781,6 @@ void process_dohfd(uint32_t events) {
                     uint16_t serverid = ((uint8_t *)buf)[0] << 8 | ((uint8_t *)buf)[1];
                     dnsreq_refresh_expire(serverid);
                 }
-                free(buf);
             }
         }
 
@@ -1070,11 +1078,11 @@ void process_dohrfd(void *data, uint32_t events) {
                             printf("server id: %d\n", serverid);
                             iothdns_rewrite_header(pkt, serverid, h.flags);
 
-#if FWD_PKT_DUMP
+
                             printf("%d %d\n",h.id,serverid);
                             printf("========>>>>>>>>>>>>\n");
-                            packetdump(stdout, td->buf, td->len);
-#endif
+                            packetdump(stdout, dd->buf, dd->len);
+
                             /* tcpq_enqueue delays the send to a POLLOUT event on the connection to the remote DNS server */
                             /* the queue is shared: it is more a feature than a bug.
                              * A fast server can steal requests intentionally for another server */
