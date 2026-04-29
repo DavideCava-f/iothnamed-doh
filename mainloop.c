@@ -54,6 +54,8 @@
 #define USE_DOH 1
 #define HTTPS_PORT 443
 #define DNS_UDP_PORT 53
+#define MAX_TRACKED_DOH 1000
+
 #define ckretval(retval, X) do { \
 	if (retval < 0) { \
 		printlog(LOG_ERR, X ": %s", strerror(errno)); \
@@ -113,6 +115,8 @@ struct dohdata {
     size_t write_len;    
     size_t write_pos;
 };
+
+static struct dohdata *doh_client_map[MAX_TRACKED_DOH] = {NULL}; 
 
 /* DOH forward function prototypes */
 int doh_wrap_dns_req(char *http_req, size_t http_req_max_len, char *buf, size_t len, const char *remote_server);
@@ -183,8 +187,8 @@ void process_urfd(void) {
 			int serverid = dnsreq_put(h.id, h.qname, h.qtype, urfd, &msghdr);
 			iothdns_rewrite_header(pkt, serverid, h.flags);
 #if FWD_PKT_DUMP
-			printf("%d %d\n",h.id,serverid);
-			printf("========>>>>>>>>>>>>\n");
+            printlog(LOG_INFO, "%d %d", h.id, serverid);
+            printlog(LOG_INFO, "========>>>>>>>>>>>>");
 			packetdump(stdout, buf, len);
 #endif
 			struct sockaddr_in6 sfwd = {
@@ -192,7 +196,7 @@ void process_urfd(void) {
 				.sin6_addr = fwdaddr[fwdaddr_rr],
 				.sin6_port = htons(DNS_UDP_PORT)};
             
-            printf("Forwarding request to fstack\n");
+            printlog(LOG_INFO, "Forwarding request to fstack");
             if(USE_DOH){
                 void *bufcopy = malloc(len);
                 if (bufcopy) {
@@ -217,7 +221,7 @@ void process_uffd(void) {
 	char qnamebuf[IOTHDNS_MAXNAME];
 	size_t len = ioth_recv(uffd, buf, IOTHDNS_UDP_MAXBUF, 0);
 #if FWD_PKT_DUMP
-	printf("========<<<<<<<<<<<<\n");
+    printlog(LOG_INFO, "========<<<<<<<<<<<<");
 	packetdump(stdout, buf, len);
 #endif
 	struct iothdns_pkt *pkt = iothdns_get_header(&h, buf, len, qnamebuf);
@@ -237,7 +241,7 @@ void process_uffd(void) {
 		};
 		int clientid = dnsreq_get(h.id, h.qname, h.qtype, &fd, &msghdr);
 #if FWD_PKT_DUMP
-		printf("%d %d\n",h.id,clientid);
+        printlog(LOG_INFO, "%d %d", h.id, clientid);
 #endif
 		if  (clientid != -1 && fd == urfd) {
 			iothdns_rewrite_header(pkt, clientid, h.flags);
@@ -257,7 +261,7 @@ static ssize_t dns_tcp_send(int fd, void *buf, size_t len, int flags) {
   hlen[0] = len >> 8;
   hlen[1] = len;
 #if FWD_PKT_DUMP
-	printf("sendmsg %d\n", fd);
+    printlog(LOG_INFO, "sendmsg %d", fd);
 #endif
   return ioth_sendmsg(fd, &msg, flags);
 }
@@ -374,15 +378,15 @@ void process_trfd(void *data) {
 				iothdns_free(rpkt);
 			} else {
 				/* forward the packet */
-                printf("client id inserted: %d\n", h.id);
+                printlog(LOG_INFO, "client id inserted: %d", h.id);
 				int serverid = dnsreq_put(h.id, h.qname, h.qtype, td->fd, NULL);
 				if (serverid >= 0) {
-                    printf("server id: %d\n", serverid);
+                    printlog(LOG_INFO, "server id: %d", serverid);
 				    iothdns_rewrite_header(pkt, serverid, h.flags);
                     
 #if FWD_PKT_DUMP
-					printf("%d %d\n",h.id,serverid);
-					printf("========>>>>>>>>>>>>\n");
+                    printlog(LOG_INFO, "%d %d", h.id, serverid);
+                    printlog(LOG_INFO, "========>>>>>>>>>>>>");
 					packetdump(stdout, td->buf, td->len);
 #endif
 					/* tcpq_enqueue delays the send to a POLLOUT event on the connection to the remote DNS server */
@@ -449,8 +453,8 @@ void process_tffd(int index, uint32_t events) {
                     iothdns_rewrite_header(pkt, clientid, h.flags);
                     struct iovec pktbuf = iothdns_getbuf(pkt);
 #if FWD_PKT_DUMP
-                    printf("%d %d\n",h.id,clientid);
-                    printf("========<<<<<<<<<<<<\n");
+                    printlog(LOG_INFO, "%d %d", h.id, clientid);
+                    printlog(LOG_INFO, "========<<<<<<<<<<<<");
                     packetdump(stdout, pktbuf.iov_base, pktbuf.iov_len);
 #endif
                     dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0);
@@ -477,11 +481,11 @@ int doh_wrap_dns_req(char* http_req, size_t http_req_max_len, char* buf, size_t 
             );
 
     if (header_len < 0 || (size_t)header_len >= http_req_max_len) {
-        printf("https-wrap: invalid header len\n");
+		printlog(LOG_ERR, "https-wrap: invalid header len");
         return -1; 
     }
     if ((size_t)header_len + len > http_req_max_len) {
-        printf("https-wrap: invalid https packet len\n");
+		printlog(LOG_ERR, "https-wrap: invalid https packet len");
         return -1; 
     }
     
@@ -493,13 +497,24 @@ int doh_wrap_dns_req(char* http_req, size_t http_req_max_len, char* buf, size_t 
 void close_doh_connection(struct dohdata* dd, char* message, int loginfo){
     printlog(loginfo, message);
     epoll_ctl(epollfd, EPOLL_CTL_DEL, dohfd, NULL);
+    
+    if (dd->fd == dohfd)
+    {
+        printlog(loginfo, "dd.fd == dohfd");
+    }
+
+    if (dd->fd >= 0 && dd->fd < MAX_TRACKED_DOH) {
+        doh_client_map[dd->fd] = NULL; 
+    }
+    
     if (dohssl) {
         wolfSSL_free(dohssl);
         dohssl = NULL;
     }
-    ioth_close(dohfd);
-    dohfd = -1;
+    ioth_close(dd->fd);
+    dd->fd  = -1;
     if (dd->buf) free(dd->buf);
+    if (dd->write_buf) free(dd->write_buf);
     memset(dd, 0, sizeof(*dd));
 }
 
@@ -696,6 +711,11 @@ ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, const char *hostname) 
         return -1;
     }
     int http_len = doh_wrap_dns_req(req_buf, req_max_len, buf, len, hostname);
+    
+    printlog(LOG_INFO, "FORMATTED HTTP REQ:\n%.*s\n", http_len, req_buf);
+    printlog(LOG_INFO, "HTTP REQ DUMP:");
+    packetdump(stdout, req_buf, http_len);
+    
     if (http_len < 0) {
         free(req_buf);
         errno = EINVAL; 
@@ -762,7 +782,7 @@ void process_dohfd(uint32_t events) {
         printlog(LOG_INFO,"dohfd POLLOUT event, is init finished? %s", wolfSSL_is_init_finished(dohssl) ? "YES" : "NO");
         if (wolfSSL_is_init_finished(dohssl)){
             /* POLLOUT event, the stream is connected and ready, send the next packet from tcpq */
-            printf("dohfd POLLOUT, extract next packet from tcpq\n");
+            printlog(LOG_INFO,"dohfd POLLOUT, extract next packet from tcpq");
             int len;
             void *buf = tcpq_dequeue(&len);
             if (buf == NULL) {
@@ -771,10 +791,12 @@ void process_dohfd(uint32_t events) {
                     .data.ptr = &dohfd
                 };
                 /* cease to wait for POLLOUT if no more packets in tcpq */
-                printf("cease wating for pollout, tcpq empty\n");
+                printlog(LOG_INFO,"tcpq empty, modifying epoll to listen only for POLLIN");
                 epoll_ctl(epollfd, EPOLL_CTL_MOD, dohfd, &ev);
             } else {
                 /* send the pkt and free the buf */
+                printlog(LOG_INFO,"sending packet to doh server");
+                packetdump(stdout, buf, len);
                 tcp_doh_send(dohssl, buf, len, "dns.google"); //TODO fix with fwdaddr
                 /* refresh the dnsreq expiry — the timeout should count from actual send, not enqueue */
                 if (len >= 2) {
@@ -787,7 +809,7 @@ void process_dohfd(uint32_t events) {
     }
     if (events & POLLIN) {
         /* POLLIN -> incoming reply */
-        printf("dohfd POLLIN, reply from remote server\n");
+        printlog(LOG_INFO,"dohfd POLLIN, reply from remote server");
 		static struct dohdata dd;
 		dd.fd = dohfd;
         dd.ssl = dohssl;
@@ -795,7 +817,7 @@ void process_dohfd(uint32_t events) {
             ssize_t rlen = tcp_doh_recv(&dd);
             if (rlen < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    printf("partial read from google\n");
+                    printlog(LOG_INFO,"partial read from doh server, waiting for next POLLIN");
                     break;
                 } 
                 close_doh_connection(&dd, "Fatal Error or Connection Close", LOG_ERR);
@@ -828,17 +850,47 @@ void process_dohfd(uint32_t events) {
                         iothdns_rewrite_header(pkt, clientid, h.flags);
                         pktbuf = iothdns_getbuf(pkt);
 
+                        if (auth_isactive(AUTH_CACHE))
+                            cache_feed(pkt);
+                            
                         #if FWD_PKT_DUMP 
-                        printf("%d %d\n",h.id,clientid);
-                        printf("========<<<<<<<<<<<<\n");
+                        printlog(LOG_INFO, "%d %d", h.id, clientid);
+                        printlog(LOG_INFO, "========<<<<<<<<<<<<");
                         packetdump(stdout, pktbuf.iov_base, pktbuf.iov_len);
                         #endif
 
                         if (fd == urfd) {
                             ioth_sendmsg(urfd, &msghdr, 0);
-                        } else {
-                            dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0);
+                        } else if (fd >= 0 && fd < MAX_TRACKED_DOH && doh_client_map[fd] != NULL) {
+                            // this was a doh client request
+                            printlog(LOG_INFO, "Forwarding DoH response to TCP client fd %d", fd);
+                            struct dohdata *client_dd = doh_client_map[fd];
+
+                            size_t max_resp_len = pktbuf.iov_len + 512; // Add some overhead for HTTP headers
+                            client_dd->write_buf = malloc(max_resp_len);
+
+                            if (client_dd->write_buf) {
+                                int http_resp_len = doh_wrap_dns_resp(client_dd->write_buf, max_resp_len, pktbuf.iov_base, pktbuf.iov_len);
+                                if (http_resp_len > 0) {
+                                    printlog(LOG_INFO, "FORMATTED HTTP RESP:\n%.*s\n", http_resp_len, client_dd->write_buf);
+                                    printlog(LOG_INFO, "HTTP RESP DUMP:");
+                                    packetdump(stdout, client_dd->write_buf, http_resp_len);
+
+                                    client_dd->write_len = http_resp_len;
+                                    client_dd->write_pos = 0;
+
+                                    struct epoll_event ev = {.events = POLLIN | POLLOUT, .data.ptr = client_dd};
+                                    epoll_ctl(epollfd, EPOLL_CTL_MOD, client_dd->fd, &ev);
+                                } else {
+                                    printlog(LOG_ERR, "Failed to format HTTP response for DoH client fd %d", fd);
+                                    free(client_dd->write_buf);
+                                    client_dd->write_buf = NULL;
+                                }
+                            }
                         }
+                        else {
+                            dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0);
+                        } 
                     }
                 }
                 iothdns_free(pkt);
@@ -913,7 +965,7 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
             struct epoll_event *event = &ev[i];
             if (event->data.ptr == &urfd){
                 // UDP client request
-                printf("udp request from rstack");
+                printlog(LOG_INFO,"UDP request received on urfd");
                 process_urfd();
             }   
             else if (event->data.ptr == &uffd)     // UDP reply from the server
@@ -978,7 +1030,9 @@ void process_dohlfd(void) {
             wolfSSL_SetIOWriteCtx(dd->ssl, (void*)(intptr_t)connfd);
 
 			fd_timeout_add(now(), connfd);
-			epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
+			
+            doh_client_map[connfd] = dd;
+            epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
 		}
 	}
 }
@@ -1033,14 +1087,14 @@ void process_dohrfd(void *data, uint32_t events) {
             ssize_t rlen = tcp_doh_server_recv(dd);
             if (rlen < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    printf("partial read dohrfd\n");
+                    printlog(LOG_INFO,"partial read from doh client, waiting for next POLLIN");
                     break;
                 } 
-                close_doh_connection(dd, "Fatal Error or Connection Close", LOG_ERR);
+                close_doh_connection(dd, "DOHRFD Fatal Error or Connection Close", LOG_ERR);
                 return;
             } 
             if(rlen == 0) {
-                close_doh_connection(dd, "Connection Closed by Peer", LOG_INFO);
+                close_doh_connection(dd, "DOHRFD Connection Closed by Peer", LOG_INFO);
                 return;
             }
             if (dd->pos == dd->len) {
@@ -1071,22 +1125,24 @@ void process_dohrfd(void *data, uint32_t events) {
                     } else {
                         // forward 
                         printlog(LOG_INFO,"forwarding dns request to remote server");
-                        printf("client id inserted: %d\n", h.id);
+						printlog(LOG_INFO, "client id inserted: %d", h.id);
                         int serverid = dnsreq_put(h.id, h.qname, h.qtype, dd->fd, NULL);
                         printlog(LOG_INFO,"dnsreq_put returned serverid: %d", serverid);
                         if (serverid >= 0) {
-                            printf("server id: %d\n", serverid);
+							printlog(LOG_INFO, "server id: %d", serverid);
                             iothdns_rewrite_header(pkt, serverid, h.flags);
 
 
-                            printf("%d %d\n",h.id,serverid);
-                            printf("========>>>>>>>>>>>>\n");
+							printlog(LOG_INFO, "%d %d", h.id, serverid);
+							printlog(LOG_INFO, "========>>>>>>>>>>>>");
                             packetdump(stdout, dd->buf, dd->len);
 
                             /* tcpq_enqueue delays the send to a POLLOUT event on the connection to the remote DNS server */
                             /* the queue is shared: it is more a feature than a bug.
                              * A fast server can steal requests intentionally for another server */
                             tcpq_enqueue(dd->buf, dd->len);
+                            /* Ownership moved to tcpq: do not free this buffer below. */
+                            dd->buf = NULL;
                             // why would i not use doh when receiving doh requests? lol
                             if(USE_DOH) {
                                 wake_doh();
@@ -1115,10 +1171,24 @@ void process_dohrfd(void *data, uint32_t events) {
     }
 
     if (events & POLLOUT) {
+        printlog(LOG_INFO,"dohrfd POLLOUT event, sending response to doh client");
+        if (dd->write_buf == NULL) {
+            printlog(LOG_INFO,"no data to write to doh client, modifying epoll to wait for POLLIN only");
+            //epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
+            return;
+        } else if (dd->write_pos >= dd->write_len) {
+            printlog(LOG_INFO,"all data already sent to doh client, modifying epoll to wait for POLLIN only");
+            epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
+            return;
+        }
         if (dd->write_buf != NULL && dd->write_pos < dd->write_len) {
+            printlog(LOG_INFO, "packet dump of response being sent to doh client:");
+            packetdump(stdout, dd->write_buf + dd->write_pos, dd->write_len - dd->write_pos);
+            printlog(LOG_INFO, "========>>>>>>>>>>>>");
             int ret = wolfSSL_write(dd->ssl, dd->write_buf + dd->write_pos, dd->write_len - dd->write_pos);
             
             if (ret > 0) {
+                printlog(LOG_INFO,"sent %d bytes to doh client", ret);
                 dd->write_pos += ret;
                 if (dd->write_pos == dd->write_len) {
                     free(dd->write_buf);
@@ -1135,9 +1205,11 @@ void process_dohrfd(void *data, uint32_t events) {
                     dd->len = 0;
                     
                     // Go back to only waiting for incoming data
+                    printlog(LOG_INFO,"response fully sent, switching back to POLLIN for next request");
                     epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
                 }
             } else {
+                printlog(LOG_INFO,"partial/failed write to doh client, ret=%d", ret);
                 int err = wolfSSL_get_error(dd->ssl, ret);
                 if (err != WOLFSSL_ERROR_WANT_WRITE && err != WOLFSSL_ERROR_WANT_READ) {
                     printlog(LOG_ERR, "process_dohrfd: error writing response");

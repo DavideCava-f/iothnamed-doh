@@ -1,2 +1,2 @@
-- error 400 bad request
-  - controllare come è formattato il pacchetto che inoltriamo
+- Updated parsing
+- Code cleaning and refactoring
