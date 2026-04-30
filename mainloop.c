@@ -51,7 +51,6 @@
 #include <wolfssl/ssl.h>
 #include <wolfssl/test.h>
 
-#define USE_DOH 1
 #define HTTPS_PORT 443
 #define DNS_UDP_PORT 53
 #define MAX_TRACKED_DOH 1000
@@ -96,6 +95,7 @@ static WOLFSSL_CTX *doh_server_ctx;
 
 static int tcp_listen_backlog = 5;
 
+static int USE_DOH=0
 // DOH
 struct dohdata {
     enum client_type ctype;
@@ -911,7 +911,7 @@ void process_dohfd(uint32_t events) {
 
 #define NEVENTS 8
 
-int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdaddr, int _fwdaddr_count) {
+int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdaddr, int _fwdaddr_count, int _use_doh) {
     printlog(LOG_INFO,"Starting mainloop");
     int retval;
     int on = 1;
@@ -919,8 +919,9 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
     fstack = _fstack;
     fwdaddr = _fwdaddr;
     fwdaddr_count = _fwdaddr_count;
+    USE_DOH=1
 
-    struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
+        struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
     struct sockaddr_in6 scli_doh = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(HTTPS_PORT)};
     init_ssl_ctx(); 
     init_ssl_server_ctx();
