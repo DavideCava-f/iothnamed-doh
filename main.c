@@ -42,9 +42,11 @@
 
 static struct ioth *rstack; // req stack
 static struct ioth *fstack; // fwd stack
-static int fwdaddrDNS_count;
-static int fwdaddrDOH_count;
+static int fwdaddrDNS_count = 0;
+static int fwdaddrDOH_count = 0;
 static struct in6_addr fwdaddr[IOTHDNS_MAXNS];
+static char* fwdaddrDOH_hostnames[IOTHDNS_MAXNS];
+
 
 static int stropt_spaces(const char *input, char **tags, char *buf) {
 	return stroptx(input, "'\"\\", " \t", 0, tags, NULL, buf);
@@ -314,6 +316,7 @@ int parsercfile(char *path) {
                             printlog(LOG_ERR, "%s (line %d): up to three %s may be listed", path, lineno, optname);
                             errno = EINVAL, retvalue = -1;
                         } else {
+							
                             if (inet_ptonx(AF_INET6, value, &fwdaddr[fwdaddrDNS_count]) == 1)
                                 fwdaddrDNS_count++;
                             else {
@@ -333,6 +336,12 @@ int parsercfile(char *path) {
                             printlog(LOG_ERR, "%s (line %d): up to three %s may be listed", path, lineno, optname);
                             errno = EINVAL, retvalue = -1;
                         } else {
+							strtok(value, " ");
+							fwdaddrDOH_hostnames[fwdaddrDOH_count] = malloc(strlen(value) + 1);
+							strcpy(fwdaddrDOH_hostnames[fwdaddrDOH_count], value);
+
+							strtok(NULL, " ");
+							printlog(LOG_INFO, "Adding DOH forwarder: %s", value);
                             if (inet_ptonx(AF_INET6, value, &fwdaddr[fwdaddrDOH_count]) == 1)
                                 fwdaddrDOH_count++;
                             else {
@@ -489,14 +498,16 @@ int main(int argc, char *argv[])
 #endif
     int fwdaddrToSend_count=0;
     if (fwdaddrDOH_count > 0){
+		printlog(LOG_INFO, "DOH MODE ENABLED - forwarding to DOH servers, DOH COUNT: %d", fwdaddrDOH_count);
         useDOH = 1;
         fwdaddrToSend_count = fwdaddrDOH_count;
     }else{
+		printlog(LOG_INFO, "DOH MODE DISABLED - forwarding to classic DNS servers, DNS COUNT: %d", fwdaddrDNS_count);
         useDOH = 0;
-        fwdaddrToSend_count = fwdaddrDOH_count;
+        fwdaddrToSend_count = fwdaddrDNS_count;
     }
 
-	if (mainloop(rstack, fstack, fwdaddr, fwdaddrToSend_count) < 0)
+	if (mainloop(rstack, fstack, fwdaddr, fwdaddrDOH_hostnames, fwdaddrToSend_count, useDOH) < 0)
 		exit(1);
 	return 0;
 }

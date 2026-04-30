@@ -70,6 +70,7 @@ enum client_type {
 static struct ioth *rstack; // req stack
 static struct ioth *fstack; // fwd stack
 static struct in6_addr *fwdaddr;
+static char **fwdaddrDOH_hostnames;
 static int fwdaddr_count;
 static int fwdaddr_rr; // round robin scan index
 
@@ -95,7 +96,7 @@ static WOLFSSL_CTX *doh_server_ctx;
 
 static int tcp_listen_backlog = 5;
 
-static int USE_DOH=0
+static int USE_DOH=0;
 // DOH
 struct dohdata {
     enum client_type ctype;
@@ -127,8 +128,8 @@ void init_ssl_ctx();
 static int wake_doh(void);
 static long parse_content_length(const char *headers);
 ssize_t tcp_doh_recv(struct dohdata *dd);
-ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, const char *hostname);
-void process_dohfd(uint32_t events);
+ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, char *hostname);
+void process_dohfd(int index, uint32_t events);
 
 /* DOH listening function prototypes */
 void process_dohlfd(void); // listen for https requests and open ssl connection if needed
@@ -333,6 +334,7 @@ static int wake_tcp(void) {
 		.data.ptr = &tffd[fwdaddr_rr]
 	};
 	if (tffd[fwdaddr_rr] < 0) {
+        printlog(LOG_INFO,"tcp - connection not active, performing asynch connect");
 		int retval;
 		struct sockaddr_in6 sfwd = {.sin6_family = AF_INET6, .sin6_addr = fwdaddr[fwdaddr_rr], .sin6_port = htons(DNS_UDP_PORT)};
 		retval = tffd[fwdaddr_rr] = ioth_msocket(fstack, AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -341,9 +343,11 @@ static int wake_tcp(void) {
 		if (retval < 0 && errno != EINPROGRESS)
 			ckretval(retval, "tcp forward fd connect");
 		epoll_ctl(epollfd, EPOLL_CTL_ADD, tffd[fwdaddr_rr], &ev);
-	} else
+	} else {
+        printlog(LOG_INFO,"tcp - connection active");
 		epoll_ctl(epollfd, EPOLL_CTL_MOD, tffd[fwdaddr_rr], &ev);
-	fwdaddr_rr = (fwdaddr_rr + 1) % fwdaddr_count;
+    }
+        fwdaddr_rr = (fwdaddr_rr + 1) % fwdaddr_count;
 	return 0;
 }
 
@@ -496,7 +500,7 @@ int doh_wrap_dns_req(char* http_req, size_t http_req_max_len, char* buf, size_t 
 
 void close_doh_connection(struct dohdata* dd, char* message, int loginfo){
     printlog(loginfo, message);
-    epoll_ctl(epollfd, EPOLL_CTL_DEL, dohfd, NULL);
+    epoll_ctl(epollfd, EPOLL_CTL_DEL, dohfd[fwdaddr_rr], NULL);
     
     if (dd->fd == dohfd[fwdaddr_rr])
     {
@@ -513,6 +517,7 @@ void close_doh_connection(struct dohdata* dd, char* message, int loginfo){
     }
     ioth_close(dd->fd);
     dd->fd  = -1;
+    dohfd[fwdaddr_rr] = -1;
     if (dd->buf) free(dd->buf);
     if (dd->write_buf) free(dd->write_buf);
     memset(dd, 0, sizeof(*dd));
@@ -700,7 +705,7 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
     return 0;
 }
 
-ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, const char *hostname) {
+ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, char *hostname) {
     printlog(LOG_INFO,"forwarding dns request to doh server");
     size_t overhead = 512;
     size_t req_max_len = len + overhead;
@@ -797,7 +802,7 @@ void process_dohfd(int index,uint32_t events) {
                 /* send the pkt and free the buf */
                 printlog(LOG_INFO,"sending packet to doh server");
                 packetdump(stdout, buf, len);
-                tcp_doh_send(dohssl, buf, len, "dns.google"); //TODO fix with fwdaddr
+                tcp_doh_send(dohssl, buf, len, fwdaddrDOH_hostnames[index]); //TODO fix with fwdaddr
                 /* refresh the dnsreq expiry — the timeout should count from actual send, not enqueue */
                 if (len >= 2) {
                     uint16_t serverid = ((uint8_t *)buf)[0] << 8 | ((uint8_t *)buf)[1];
@@ -911,20 +916,25 @@ void process_dohfd(int index,uint32_t events) {
 
 #define NEVENTS 8
 
-int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdaddr, int _fwdaddr_count, int _use_doh) {
+int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdaddr, char** _fwdaddrDOH_hostnames, int _fwdaddr_count, int _use_doh) {
     printlog(LOG_INFO,"Starting mainloop");
     int retval;
     int on = 1;
     rstack = _rstack;
     fstack = _fstack;
     fwdaddr = _fwdaddr;
+    fwdaddrDOH_hostnames = _fwdaddrDOH_hostnames;
     fwdaddr_count = _fwdaddr_count;
-    USE_DOH=1
+    USE_DOH=_use_doh;
 
-        struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
+    struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
     struct sockaddr_in6 scli_doh = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(HTTPS_PORT)};
-    init_ssl_ctx(); 
-    init_ssl_server_ctx();
+    printlog(LOG_INFO,"use_doh: %d", USE_DOH);
+    if (USE_DOH) {
+        init_ssl_ctx();
+        init_ssl_server_ctx();
+    }
+    
 
     retval = urfd = ioth_msocket(rstack, AF_INET6, SOCK_DGRAM, 0);
     ckretval(retval, "udp request fd msocket");
