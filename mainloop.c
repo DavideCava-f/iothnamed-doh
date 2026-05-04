@@ -188,8 +188,6 @@ void process_urfd(void) {
 			int serverid = dnsreq_put(h.id, h.qname, h.qtype, urfd, &msghdr);
 			iothdns_rewrite_header(pkt, serverid, h.flags);
 #if FWD_PKT_DUMP
-            //printlog(LOG_INFO, "%d %d", h.id, serverid);
-            //printlog(LOG_INFO, "========>>>>>>>>>>>>");
 			packetdump(stdout, buf, len);
 #endif
 			struct sockaddr_in6 sfwd = {
@@ -197,7 +195,6 @@ void process_urfd(void) {
 				.sin6_addr = fwdaddr[fwdaddr_rr],
 				.sin6_port = htons(DNS_UDP_PORT)};
             
-            //printlog(LOG_INFO, "Forwarding request to fstack");
             if(USE_DOH){
                 void *bufcopy = malloc(len);
                 if (bufcopy) {
@@ -222,7 +219,6 @@ void process_uffd(void) {
 	char qnamebuf[IOTHDNS_MAXNAME];
 	size_t len = ioth_recv(uffd, buf, IOTHDNS_UDP_MAXBUF, 0);
 #if FWD_PKT_DUMP
-    //printlog(LOG_INFO, "========<<<<<<<<<<<<");
 	packetdump(stdout, buf, len);
 #endif
 	struct iothdns_pkt *pkt = iothdns_get_header(&h, buf, len, qnamebuf);
@@ -242,7 +238,6 @@ void process_uffd(void) {
 		};
 		int clientid = dnsreq_get(h.id, h.qname, h.qtype, &fd, &msghdr);
 #if FWD_PKT_DUMP
-        //printlog(LOG_INFO, "%d %d", h.id, clientid);
 #endif
 		if  (clientid != -1 && fd == urfd) {
 			iothdns_rewrite_header(pkt, clientid, h.flags);
@@ -262,7 +257,6 @@ static ssize_t dns_tcp_send(int fd, void *buf, size_t len, int flags) {
   hlen[0] = len >> 8;
   hlen[1] = len;
 #if FWD_PKT_DUMP
-    //printlog(LOG_INFO, "sendmsg %d", fd);
 #endif
   return ioth_sendmsg(fd, &msg, flags);
 }
@@ -334,7 +328,6 @@ static int wake_tcp(void) {
 		.data.ptr = &tffd[fwdaddr_rr]
 	};
 	if (tffd[fwdaddr_rr] < 0) {
-        ////printlog(LOG_INFO,"tcp - connection not active, performing asynch connect");
 		int retval;
 		struct sockaddr_in6 sfwd = {.sin6_family = AF_INET6, .sin6_addr = fwdaddr[fwdaddr_rr], .sin6_port = htons(DNS_UDP_PORT)};
 		retval = tffd[fwdaddr_rr] = ioth_msocket(fstack, AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -344,7 +337,6 @@ static int wake_tcp(void) {
 			ckretval(retval, "tcp forward fd connect");
 		epoll_ctl(epollfd, EPOLL_CTL_ADD, tffd[fwdaddr_rr], &ev);
 	} else {
-        ////printlog(LOG_INFO,"tcp - connection active");
 		epoll_ctl(epollfd, EPOLL_CTL_MOD, tffd[fwdaddr_rr], &ev);
     }
         fwdaddr_rr = (fwdaddr_rr + 1) % fwdaddr_count;
@@ -382,15 +374,13 @@ void process_trfd(void *data) {
 				iothdns_free(rpkt);
 			} else {
 				/* forward the packet */
-                ////printlog(LOG_INFO, "client id inserted: %d", h.id);
 				int serverid = dnsreq_put(h.id, h.qname, h.qtype, td->fd, NULL);
 				if (serverid >= 0) {
-                    ////printlog(LOG_INFO, "server id: %d", serverid);
 				    iothdns_rewrite_header(pkt, serverid, h.flags);
                     
 #if FWD_PKT_DUMP
-                    //printlog(LOG_INFO, "%d %d", h.id, serverid);
-                    //printlog(LOG_INFO, "========>>>>>>>>>>>>");
+                    // , "%d %d", h.id, serverid);
+                    // , "========>>>>>>>>>>>>");
 					packetdump(stdout, td->buf, td->len);
 #endif
 					/* tcpq_enqueue delays the send to a POLLOUT event on the connection to the remote DNS server */
@@ -457,8 +447,6 @@ void process_tffd(int index, uint32_t events) {
                     iothdns_rewrite_header(pkt, clientid, h.flags);
                     struct iovec pktbuf = iothdns_getbuf(pkt);
 #if FWD_PKT_DUMP
-                    //printlog(LOG_INFO, "%d %d", h.id, clientid);
-                    //printlog(LOG_INFO, "========<<<<<<<<<<<<");
                     packetdump(stdout, pktbuf.iov_base, pktbuf.iov_len);
 #endif
                     dns_tcp_send(fd, pktbuf.iov_base, pktbuf.iov_len, 0);
@@ -557,7 +545,6 @@ void init_ssl_client_ctx() {
     // bind calback functions
     wolfSSL_SetIORecv(doh_client_ctx, doh_ssl_recv_cb);
     wolfSSL_SetIOSend(doh_client_ctx, doh_ssl_send_cb);
-    ////printlog(LOG_INFO,"SSL context correctly initialized");
 }
 
 
@@ -568,13 +555,9 @@ static int wake_doh(void) {
 		.data.ptr = &dohffd[fwdaddr_rr]
 	};
 	if (dohffd[fwdaddr_rr] < 0) {
-        ////printlog(LOG_INFO,"doh - connection not active, performing asynch connect");
 		int retval;
-        ////printlog(LOG_INFO,"doh - creating socket");
 		struct sockaddr_in6 sfwd = {.sin6_family = AF_INET6, .sin6_addr = fwdaddr[fwdaddr_rr], .sin6_port = htons(HTTPS_PORT)};
-		////printlog(LOG_INFO,"doh - connecting to doh server");
         retval = dohffd[fwdaddr_rr] = ioth_msocket(fstack, AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
-		////printlog(LOG_INFO,"doh - socket created");
         ckretval(retval, "doh forward fd msocket");
 		retval = ioth_connect(dohffd[fwdaddr_rr], (struct sockaddr *)&sfwd, sizeof(sfwd));
 		if (retval < 0 && errno != EINPROGRESS)
@@ -584,14 +567,11 @@ static int wake_doh(void) {
         wolfSSL_SetIOReadCtx(dohssl, (void*)(intptr_t)dohffd[fwdaddr_rr]);
         wolfSSL_SetIOWriteCtx(dohssl, (void*)(intptr_t)dohffd[fwdaddr_rr]);
         int res = wolfSSL_connect(dohssl);
-        ////printlog(LOG_INFO,"doh - SSL connect initiated");
 		epoll_ctl(epollfd, EPOLL_CTL_ADD, dohffd[fwdaddr_rr], &ev);
 	} else {
-        ////printlog(LOG_INFO,"doh - connection active");
 		epoll_ctl(epollfd, EPOLL_CTL_MOD, dohffd[fwdaddr_rr], &ev);
     }
 
-    ////printlog(LOG_INFO,"doh - connection setup complete, round robin index before increment: %d", fwdaddr_rr);
 	fwdaddr_rr = (fwdaddr_rr + 1) % fwdaddr_count;
 	return 0;
 }
@@ -610,7 +590,6 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
     ssize_t rlen;
 
     if (!dd->hdr_done) {
-        ////printlog(LOG_INFO,"header not done");
         int max_read = sizeof(dd->hdr_buf) - dd->hdr_pos - 1; /* -1 for null terminator */
         if (max_read <= 0) {
             printlog(LOG_ERR,"ERROR: Header too large");
@@ -619,10 +598,8 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
         }
         rlen = wolfSSL_read(dd->ssl, dd->hdr_buf + dd->hdr_pos, max_read);
         if (rlen <= 0) {
-            ////printlog(LOG_INFO, "rlen = %ld\n", rlen);
             int err  = wolfSSL_get_error(dohssl, rlen);
             if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
-                ////printlog(LOG_INFO,"WANT READ");
                 errno = EAGAIN;
                 return -1;
             }
@@ -677,7 +654,6 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
             }
             
             if (dd->pos == dd->len) {
-                ////printlog(LOG_INFO,"packet done");
                 return rlen; 
             }
         } else {
@@ -687,7 +663,6 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
 
     // Read DNS Body 
     if (dd->hdr_done && dd->pos < dd->len) {
-        ////printlog(LOG_INFO,"reading body");
         rlen = wolfSSL_read(dd->ssl, (char *)dd->buf + dd->pos, dd->len - dd->pos);
         
         if (rlen <= 0) {
@@ -701,7 +676,6 @@ ssize_t tcp_doh_recv(struct dohdata *dd) {
 }
 
 ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, char *hostname) {
-    ////printlog(LOG_INFO,"forwarding dns request to doh server");
     size_t overhead = 512;
     size_t req_max_len = len + overhead;
     
@@ -712,9 +686,7 @@ ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, char *hostname) {
     }
     int http_len = doh_wrap_dns_req(req_buf, req_max_len, buf, len, hostname);
     
-    //printlog(LOG_INFO, "FORMATTED HTTP REQ:\n%.*s\n", http_len, req_buf);
-    //printlog(LOG_INFO, "HTTP REQ DUMP:");
-    packetdump(stdout, req_buf, http_len);
+    //packetdump(stdout, req_buf, http_len);
     
     if (http_len < 0) {
         free(req_buf);
@@ -734,28 +706,22 @@ ssize_t tcp_doh_send(WOLFSSL *ssl, void *buf, size_t len, char *hostname) {
         return -1;
     }
 
-    ////printlog(LOG_INFO,"forwarding dns request to doh server successfull");
     return ret;
 }
 
 
 void process_dohffd(int index,uint32_t events) {
-    ////printlog(LOG_INFO,"process_dohffd called with events: %u", events);
-    ////printlog(LOG_INFO, "POLLIN: %s, POLLOUT: %s", (events & POLLIN) ? "YES" : "NO", (events & POLLOUT) ? "YES" : "NO");
     if (!wolfSSL_is_init_finished(dohssl)) {
         int ret = wolfSSL_connect(dohssl);
         if (ret < 0) {
-            ////printlog(LOG_INFO,"handshake in progress, ret=%d", ret);
             int err = wolfSSL_get_error(dohssl, ret);
             if (err == WOLFSSL_ERROR_WANT_READ) {
-                ////printlog(LOG_INFO,"Handshake needs to read: WANT_READ");
                 /* Handshake needs to read: Ensure we listen for POLLIN */
                 struct epoll_event ev = { .events = POLLIN, .data.ptr = &dohffd[index] };
                 epoll_ctl(epollfd, EPOLL_CTL_MOD, dohffd[index], &ev);
                 return; 
             }
             if (err == WOLFSSL_ERROR_WANT_WRITE) {
-                ////printlog(LOG_INFO,"Handshake needs to write: WANT_WRITE");
                 /* Handshake needs to write: Ensure we listen for POLLOUT */
                 struct epoll_event ev = { .events = POLLIN | POLLOUT, .data.ptr = &dohffd[index] };
                 epoll_ctl(epollfd, EPOLL_CTL_MOD, dohffd[index], &ev);
@@ -772,17 +738,14 @@ void process_dohffd(int index,uint32_t events) {
         }
         /* Handshake just completed. Don't process POLLIN yet —
            there's no DNS response pending, only send queued data. */
-        ////printlog(LOG_INFO,"dohffd: TLS handshake completed");
         events &= ~POLLIN;
         events |= POLLOUT; /* Force POLLOUT processing to send queued data */
         epoll_ctl(epollfd, EPOLL_CTL_MOD, dohffd[index], &(struct epoll_event){.events = POLLOUT, .data.ptr = &dohffd[index]});
 
     }
     if (events & POLLOUT) {
-        ////printlog(LOG_INFO,"dohffd POLLOUT event, is init finished? %s", wolfSSL_is_init_finished(dohssl) ? "YES" : "NO");
         if (wolfSSL_is_init_finished(dohssl)){
             /* POLLOUT event, the stream is connected and ready, send the next packet from tcpq */
-            ////printlog(LOG_INFO,"dohffd POLLOUT, extract next packet from tcpq");
             int len;
             void *buf = tcpq_dequeue(&len);
             if (buf == NULL) {
@@ -791,12 +754,10 @@ void process_dohffd(int index,uint32_t events) {
                     .data.ptr = &dohffd[index]
                 };
                 /* cease to wait for POLLOUT if no more packets in tcpq */
-                ////printlog(LOG_INFO,"tcpq empty, modifying epoll to listen only for POLLIN");
                 epoll_ctl(epollfd, EPOLL_CTL_MOD, dohffd[index], &ev);
             } else {
                 /* send the pkt and free the buf */
-                ////printlog(LOG_INFO,"sending packet to doh server");
-                packetdump(stdout, buf, len);
+                // packetdump(stdout, buf, len);
                 tcp_doh_send(dohssl, buf, len, fwdaddrDOH_hostnames[index]); //TODO fix with fwdaddr
                 /* refresh the dnsreq expiry — the timeout should count from actual send, not enqueue */
                 if (len >= 2) {
@@ -809,7 +770,6 @@ void process_dohffd(int index,uint32_t events) {
     }
     if (events & POLLIN) {
         /* POLLIN -> incoming reply */
-        ////printlog(LOG_INFO,"dohffd POLLIN, reply from remote server");
 		static struct dohdata dd;
 		dd.fd = dohffd[index];
         dd.ssl = dohssl;
@@ -817,7 +777,6 @@ void process_dohffd(int index,uint32_t events) {
             ssize_t rlen = tcp_doh_recv(&dd);
             if (rlen < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    ////printlog(LOG_INFO,"partial read from doh server, waiting for next POLLIN");
                     break;
                 } 
                 close_doh_connection(&dd, "Fatal Error or Connection Close", LOG_ERR);
@@ -832,7 +791,9 @@ void process_dohffd(int index,uint32_t events) {
                 char qnamebuf[IOTHDNS_MAXNAME];
                 struct iothdns_pkt *pkt = iothdns_get_header(&h, dd.buf, dd.len, qnamebuf);
                 if (pkt) {
-                    ////printlog(LOG_INFO,"iothdns_pkt not null");
+                    if (auth_isactive(AUTH_CACHE)){
+                        cache_feed(pkt);
+                    }
                     int fd;
                     uint8_t ctlbuf[CMSG_PKTINFO_SIZE];
                     struct sockaddr_in6 sock;
@@ -850,12 +811,9 @@ void process_dohffd(int index,uint32_t events) {
                         iothdns_rewrite_header(pkt, clientid, h.flags);
                         pktbuf = iothdns_getbuf(pkt);
 
-                        if (auth_isactive(AUTH_CACHE))
-                            cache_feed(pkt);
+
                             
                         #if FWD_PKT_DUMP 
-                        //printlog(LOG_INFO, "%d %d", h.id, clientid);
-                        //printlog(LOG_INFO, "========<<<<<<<<<<<<");
                         packetdump(stdout, pktbuf.iov_base, pktbuf.iov_len);
                         #endif
 
@@ -863,7 +821,6 @@ void process_dohffd(int index,uint32_t events) {
                             ioth_sendmsg(urfd, &msghdr, 0);
                         } else if (fd >= 0 && fd < MAX_TRACKED_DOH && doh_client_map[fd] != NULL) {
                             // this was a doh client request
-                            //printlog(LOG_INFO, "Forwarding DoH response to TCP client fd %d", fd);
                             struct dohdata *client_dd = doh_client_map[fd];
 
                             size_t max_resp_len = pktbuf.iov_len + 512; // Add some overhead for HTTP headers
@@ -872,8 +829,6 @@ void process_dohffd(int index,uint32_t events) {
                             if (client_dd->write_buf) {
                                 int http_resp_len = doh_wrap_dns_resp(client_dd->write_buf, max_resp_len, pktbuf.iov_base, pktbuf.iov_len);
                                 if (http_resp_len > 0) {
-                                    //printlog(LOG_INFO, "FORMATTED HTTP RESP:\n%.*s\n", http_resp_len, client_dd->write_buf);
-                                    //printlog(LOG_INFO, "HTTP RESP DUMP:");
                                     //packetdump(stdout, client_dd->write_buf, http_resp_len);
 
                                     client_dd->write_len = http_resp_len;
@@ -912,7 +867,6 @@ void process_dohffd(int index,uint32_t events) {
 #define NEVENTS 8
 
 int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdaddr, char** _fwdaddrDOH_hostnames, int _fwdaddr_count, int _use_doh) {
-    //printlog(LOG_INFO,"Starting mainloop");
     int retval;
     int on = 1;
     rstack = _rstack;
@@ -924,7 +878,6 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
 
     struct sockaddr_in6 scli = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(DNS_UDP_PORT)};
     struct sockaddr_in6 scli_doh = {.sin6_family = AF_INET6, .sin6_addr = in6addr_any, .sin6_port = htons(HTTPS_PORT)};
-    //printlog(LOG_INFO,"use_doh: %d", USE_DOH);
     if (USE_DOH) {
         init_ssl_client_ctx();
         init_ssl_server_ctx();
@@ -971,7 +924,6 @@ int mainloop(struct ioth *_rstack, struct ioth *_fstack, struct in6_addr *_fwdad
             struct epoll_event *event = &ev[i];
             if (event->data.ptr == &urfd){
                 // UDP client request
-                //printlog(LOG_INFO,"UDP request received on urfd");
                 process_urfd();
             }   
             else if (event->data.ptr == &uffd)     // UDP reply from the server
@@ -1064,7 +1016,6 @@ void init_ssl_server_ctx() {
     // bind calback functions
     wolfSSL_SetIORecv(doh_server_ctx, doh_ssl_recv_cb);
     wolfSSL_SetIOSend(doh_server_ctx, doh_ssl_send_cb);
-    //printlog(LOG_INFO,"SSL context correctly initialized");
 }
 
 
@@ -1096,9 +1047,9 @@ void process_dohrfd(void *data, uint32_t events) {
             ssize_t rlen = tcp_doh_server_recv(dd);
             if (rlen < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    //printlog(LOG_INFO,"partial read from doh client, waiting for next POLLIN");
                     break;
                 } 
+                printlog(LOG_ERR,"DOHRFD Fatal Error on read: %s", strerror(errno));
                 close_doh_connection(dd, "DOHRFD Fatal Error or Connection Close", LOG_ERR);
                 return;
             } 
@@ -1133,17 +1084,11 @@ void process_dohrfd(void *data, uint32_t events) {
                         iothdns_free(rpkt);
                     } else {
                         // forward 
-                        //printlog(LOG_INFO,"forwarding dns request to remote server");
-						//printlog(LOG_INFO, "client id inserted: %d", h.id);
                         int serverid = dnsreq_put(h.id, h.qname, h.qtype, dd->fd, NULL);
-                        //printlog(LOG_INFO,"dnsreq_put returned serverid: %d", serverid);
                         if (serverid >= 0) {
-							//printlog(LOG_INFO, "server id: %d", serverid);
                             iothdns_rewrite_header(pkt, serverid, h.flags);
 
 
-							//printlog(LOG_INFO, "%d %d", h.id, serverid);
-							//printlog(LOG_INFO, "========>>>>>>>>>>>>");
                             //packetdump(stdout, dd->buf, dd->len);
 
                             /* tcpq_enqueue delays the send to a POLLOUT event on the connection to the remote DNS server */
@@ -1158,19 +1103,15 @@ void process_dohrfd(void *data, uint32_t events) {
                             }else{
                                 wake_tcp();
                             }
-                            //printlog(LOG_INFO,"dns request forwarded to remote server, waiting for response");
                         }
                     }
                 }
                 free(dd->buf);
-                //printlog(LOG_INFO,"freeing dd->buf and resetting state for next request");
                 dd->buf = NULL;
-                //printlog(LOG_INFO,"resetting dd->hdr_done, dd->hdr_pos, dd->pos, dd->len");
                 dd->hdr_done = 0;
                 dd->hdr_pos = 0;
                 dd->pos = 0;
                 dd->len = 0;
-                //printlog(LOG_INFO,"packet done, waiting for next request on the same connection (HTTP Keep-Alive)");
                 // Continue the loop to see if a second HTTP request is waiting
                 continue;
             }
@@ -1180,24 +1121,24 @@ void process_dohrfd(void *data, uint32_t events) {
     }
     /* SENDING RESPONSE BACK TO CLIENT */
     if (events & POLLOUT) {
-        //printlog(LOG_INFO,"dohrfd POLLOUT event, sending response to doh client");
         if (dd->write_buf == NULL) {
-            //printlog(LOG_INFO,"no data to write to doh client, modifying epoll to wait for POLLIN only");
             //epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
             return;
         } else if (dd->write_pos >= dd->write_len) {
-            //printlog(LOG_INFO,"all data already sent to doh client, modifying epoll to wait for POLLIN only");
             epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
             return;
         }
         if (dd->write_buf != NULL && dd->write_pos < dd->write_len) {
-            //printlog(LOG_INFO, "packet dump of response being sent to doh client:");
-            packetdump(stdout, dd->write_buf + dd->write_pos, dd->write_len - dd->write_pos);
-            //printlog(LOG_INFO, "========>>>>>>>>>>>>");
+            fprintf(stdout, "START PACKET DUMP\n");
+            hex_packetdump(stdout, dd->write_buf + dd->write_pos, dd->write_len - dd->write_pos);
+            fprintf(stdout, "END PACKET DUMP\n");
+
+#if FWD_PKT_DUMP
+			packetdump(stdout, dd->write_buf + dd->write_pos, dd->write_len - dd->write_pos);
+#endif
             int ret = wolfSSL_write(dd->ssl, dd->write_buf + dd->write_pos, dd->write_len - dd->write_pos);
             
             if (ret > 0) {
-                //printlog(LOG_INFO,"sent %d bytes to doh client", ret);
                 dd->write_pos += ret;
                 if (dd->write_pos == dd->write_len) {
                     free(dd->write_buf);
@@ -1214,11 +1155,9 @@ void process_dohrfd(void *data, uint32_t events) {
                     dd->len = 0;
                     
                     // Go back to only waiting for incoming data
-                    //printlog(LOG_INFO,"response fully sent, switching back to POLLIN for next request");
                     epoll_ctl(epollfd, EPOLL_CTL_MOD, dd->fd, &((struct epoll_event){.events=POLLIN, .data.ptr = dd}));
                 }
             } else {
-                //printlog(LOG_INFO,"partial/failed write to doh client, ret=%d", ret);
                 int err = wolfSSL_get_error(dd->ssl, ret);
                 if (err != WOLFSSL_ERROR_WANT_WRITE && err != WOLFSSL_ERROR_WANT_READ) {
                     printlog(LOG_ERR, "process_dohrfd: error writing response");
@@ -1264,8 +1203,10 @@ ssize_t tcp_doh_server_recv(struct dohdata *dd) {
         }
         
         rlen = wolfSSL_read(dd->ssl, dd->hdr_buf + dd->hdr_pos, max_read);
-        if (rlen <= 0) {
+        if (rlen < 0) {
             int err  = wolfSSL_get_error(dd->ssl, rlen);
+            char error[256];
+            wolfSSL_ERR_error_string(err, error);
             if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
                 errno = EAGAIN;
                 return -1;

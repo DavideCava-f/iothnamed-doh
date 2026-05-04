@@ -341,7 +341,6 @@ int parsercfile(char *path) {
 							strcpy(fwdaddrDOH_hostnames[fwdaddrDOH_count], value);
 
 							strtok(NULL, " ");
-							printlog(LOG_INFO, "Adding DOH forwarder: %s", value);
                             if (inet_ptonx(AF_INET6, value, &fwdaddr[fwdaddrDOH_count]) == 1)
                                 fwdaddrDOH_count++;
                             else {
@@ -498,11 +497,9 @@ int main(int argc, char *argv[])
 #endif
     int fwdaddrToSend_count=0;
     if (fwdaddrDOH_count > 0){
-		printlog(LOG_INFO, "DOH MODE ENABLED - forwarding to DOH servers, DOH COUNT: %d", fwdaddrDOH_count);
         useDOH = 1;
         fwdaddrToSend_count = fwdaddrDOH_count;
     }else{
-		printlog(LOG_INFO, "DOH MODE DISABLED - forwarding to classic DNS servers, DNS COUNT: %d", fwdaddrDNS_count);
         useDOH = 0;
         fwdaddrToSend_count = fwdaddrDNS_count;
     }

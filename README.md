@@ -72,8 +72,9 @@ This example implements the following configuration.
 `iothnamed` runs as a server on the vde network defined by the VNL `vde:///tmp/hub`, the implementation of the stack is
 vdestack. Use the kernel stack for all the communication related to forwarded requests to other DNS servers.
 
-### dns section
-
+### dns/doh section
+YOU CAN ONLY USE EITHER DNS OR DOH, NOT BOTH TOGETHER
+#### dns
 Set the IP address/addresses of the DNS servers to forward queries when required. Up to three IP addresses can be listed.
 
 e.g.:
@@ -81,6 +82,15 @@ e.g.:
 dns       8.8.8.8
 dns       80.80.80.80
 dns      2620:119:35::35
+```
+
+#### doh
+Set the IP address/addresses and hostnames of the DOH servers to forward queries when required. Up to three DOH servers can be listed.
+
+e.g.:
+```
+doh       1.1.1.1 cloudflare-dns.com
+doh       8.8.8.8 dns.google
 ```
 ### net section
 

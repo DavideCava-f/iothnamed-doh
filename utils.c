@@ -154,3 +154,12 @@ void packetdump(FILE *f, void *arg,ssize_t len) {
 		fprintf(f, "\n");
 	}
 }
+
+void hex_packetdump(FILE *f, void *arg, ssize_t len) {
+	unsigned char *buf=arg;
+	for (size_t i = 0; i < len; i++)
+	{
+		fprintf(f, "%02x", buf[i]);
+	}
+	fprintf(f, "\n");
+}

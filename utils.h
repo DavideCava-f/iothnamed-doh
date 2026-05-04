@@ -15,5 +15,6 @@ void *memdup(const void *src, size_t n);
 uint64_t simple_stringhash(const char *str);
 
 void packetdump(FILE *f, void *arg,ssize_t len);
+void hex_packetdump(FILE *f, void *arg, ssize_t len);
 
 #endif
