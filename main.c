@@ -308,7 +308,7 @@ int parsercfile(char *path) {
 					break;
                 case STRCASE(d,n,s):
                     if (fwdaddrDOH_count > 0){
-                        printlog(LOG_ERR, "%s (line %d): DOH found, no classic DNS", path, lineno, optname);
+                        printlog(LOG_ERR, "%s (line %d): DOH already defined, use either DNS or DOH not both", path, lineno, optname);
                         errno = EINVAL, retvalue = -1;
 
                     }else{
@@ -328,7 +328,7 @@ int parsercfile(char *path) {
                     break;
                 case STRCASE(d,o,h):
                     if (fwdaddrDNS_count > 0){
-                        printlog(LOG_ERR, "%s (line %d): classic DNS found, no DOH", path, lineno, optname);
+                        printlog(LOG_ERR, "%s (line %d): classic DNS already defined, use either DNS or DOH not both", path, lineno, optname);
                         errno = EINVAL, retvalue = -1;
 
                     }else{
